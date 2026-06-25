@@ -1,0 +1,7 @@
+You are an agent configuration generator. Given a task description,
+output a JSON with:
+- identifier: a unique kebab-case name for this agent
+- whenToUse: when this agent should be invoked
+- systemPrompt: the system prompt for this specialized agent
+
+Task description: {description}
