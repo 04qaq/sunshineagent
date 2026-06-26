@@ -34,8 +34,8 @@ from src.mcp import (
 )
 from src.models.database import Database
 from src.prompt.engine import SystemPromptEngine
-from src.provider.catalog import ModelCatalog
 from src.provider.factory import ProviderFactory
+from src.provider.registry import ProviderRegistry
 from src.session.compaction import CompactionService
 from src.session.coordinator import RunCoordinator
 from src.session.service import SessionService
@@ -74,7 +74,7 @@ class AppContext:
         self.agents: AgentRegistry | None = None
         self.tools: ToolRegistry | None = None
         self.provider_factory: ProviderFactory | None = None
-        self.catalog: ModelCatalog | None = None
+        self.registry: ProviderRegistry | None = None
         self.coordinator: RunCoordinator = RunCoordinator()
         self.jobs: BackgroundJobManager = BackgroundJobManager()
         self.system_engine: SystemPromptEngine | None = None
@@ -107,8 +107,8 @@ async def _init(ctx: AppContext, workspace: Path):
     ctx.sessions = SessionService(ctx.db)
     ctx.agents = AgentRegistry(ctx.db._session_factory)
     ctx.tools = ToolRegistry()
-    ctx.catalog = ModelCatalog(c.workspace_root)
-    ctx.provider_factory = ProviderFactory(ctx.catalog)
+    ctx.registry = ProviderRegistry(c.workspace_root)
+    ctx.provider_factory = ProviderFactory(ctx.registry)
     ctx.system_engine = SystemPromptEngine(c.prompts_dir)
     ctx.compaction = CompactionService(ctx.provider_factory, ctx.sessions)
     ctx.mcp = MCPClient()
@@ -179,9 +179,16 @@ async def _send_prompt(
     abort: asyncio.Event | None = None,
 ) -> str | None:
     c = ctx.config
+    reg = ctx.registry
     _agent = agent_name or c.default_agent
-    _model = model_id or c.default_model
-    _provider = provider_id or c.default_provider
+    _model = model_id or (reg.default_model if reg else c.default_model)
+    _provider = provider_id or (reg.default_provider if reg else c.default_provider)
+
+    # 解析模型：如果是 "provider/model" 格式，拆出纯 model 名
+    raw_model = _model
+    if "/" in raw_model:
+        _provider = raw_model.split("/")[0]
+        raw_model = raw_model.split("/", 1)[1]
 
     if ctx._current_session_id is None:
         session = await ctx.sessions.create(
@@ -203,7 +210,7 @@ async def _send_prompt(
         session_id=ctx._current_session_id,
         agent_name=_agent,
         provider_id=_provider,
-        model_id=_model,
+        model_id=raw_model,
         max_steps=steps,
         permission=PermissionRuleset.all(),
         workspace=c.workspace_root,
@@ -331,9 +338,10 @@ async def _repl_async(
     await _init(app_ctx, workspace)
     load_config(c)
 
+    reg = app_ctx.registry
     _agent = c.default_agent
-    _model = c.default_model
-    _provider = c.default_provider
+    _model = reg.default_model
+    _provider = reg.default_provider
 
     console.clear()
     console.print(
@@ -361,13 +369,22 @@ async def _repl_async(
         try:
             abort.clear()
 
+            # 状态栏
+            reg = app_ctx.registry
+            m = reg.resolve(_model)
             status_line = (
                 f"[dim]{_provider}[/dim] "
-                f"[bold]{_model}[/bold]  "
-                f"agent=[bold]{_agent}[/bold]  "
-                f"key={_key_status(c, _provider)}"
+                f"[bold]{_model}[/bold]"
             )
+            if m:
+                status_line += (
+                    f"  name=[bold]{m.name}[/bold]"
+                    f"  cost={m.cost}  cap={m.capability}"
+                )
+            status_line += f"  key={_key_status(c, _provider)}"
             bu = _get_base_url(c, _provider)
+            if not bu and reg.get_provider(_provider):
+                bu = reg.get_provider(_provider).base_url
             if bu:
                 status_line += f"  base=[dim]{bu}[/dim]"
             console.print(f"  {status_line}")
@@ -431,7 +448,7 @@ async def _handle_command(
         return None
 
     if action == "/status":
-        _print_status(c, c.default_provider)
+        _print_status(ctx)
         return None
 
     if action == "/apikey":
@@ -448,39 +465,44 @@ async def _handle_command(
         else:
             console.print(f"[red]未知 provider: {prov}[/red]")
             return None
-        # 同步更新 provider catalog
-        if ctx.catalog and prov in ctx.catalog.providers:
-            ctx.catalog.providers[prov].api_key = key
+        ctx.registry.set_key(prov, key)
+        ctx.registry.save()
         ctx.provider_factory._clients.clear()
         console.print(f"[green]✓ {prov} API key 已设置[/green]")
-        save_config(c)
         return None
 
     if action == "/baseurl":
         c.openai_base_url = args if args else None
         c.anthropic_base_url = args if args else None
-        # 同步更新 provider catalog
-        if ctx.catalog and c.default_provider in ctx.catalog.providers:
-            ctx.catalog.providers[c.default_provider].base_url = args or ""
-        if args and ctx.catalog and "anthropic" in ctx.catalog.providers:
-            ctx.catalog.providers["anthropic"].base_url = args or ""
+        if ctx.registry and c.default_provider in ctx.registry.providers:
+            ctx.registry.set_url(c.default_provider, args or "")
+        ctx.registry.save()
         ctx.provider_factory._clients.clear()
         console.print(f"[green]✓ base_url = {args or '默认（已清除）'}[/green]")
-        save_config(c)
         return None
 
     if action == "/model":
         if not args:
-            _model_picker(ctx)
-            return "reload"
-        c.default_model = args
-        console.print(f"[green]✓ model = {args}[/green]")
-        save_config(c)
+            _model_list(ctx)
+            return None
+        m = ctx.registry.resolve(args)
+        if not m:
+            console.print(f"[red]模型未找到: {args}[/red]")
+            return None
+        reg = ctx.registry
+        reg.default_model = m.full_id
+        reg.default_provider = m.provider
+        reg.save()
+        console.print(f"[green]✓ {m.name} ({m.full_id})[/green]")
         return "reload"
 
     if action == "/models":
-        _model_picker(ctx)
-        return "reload"
+        _model_list(ctx)
+        return None
+
+    if action == "/providers":
+        _provider_list(ctx)
+        return None
 
     if action == "/provider":
         if not args:
@@ -671,6 +693,38 @@ async def _mcp_remove(ctx: AppContext, name: str):
     console.print(f"[green]✓ MCP server {name} 已删除[/green]")
 
 
+def _model_list(ctx):
+    """列出所有可用模型，按 provider 分组。"""
+    reg = ctx.registry
+    table = Table(title="可用模型")
+    table.add_column("模型 ID", style="dim")
+    table.add_column("名称")
+    table.add_column("Cost")
+    table.add_column("Cap")
+    for pid in reg.providers:
+        models = reg.list_models(pid)
+        for m in models:
+            cur = "→" if m.full_id == reg.default_model else " "
+            table.add_row(f"{cur} {m.full_id}", m.name, m.cost, m.capability)
+    console.print(table)
+    console.print(f"[dim]当前: {reg.default_model}  /model <id> 切换[/dim]")
+
+
+def _provider_list(ctx):
+    """列出所有已配置的 provider。"""
+    reg = ctx.registry
+    table = Table(title="Providers")
+    table.add_column("ID")
+    table.add_column("名称")
+    table.add_column("Key")
+    table.add_column("URL")
+    table.add_column("模型数")
+    for pid, p in reg.providers.items():
+        key_icon = "✓" if p.api_key else "✗"
+        table.add_row(pid, p.name, key_icon, p.base_url or "(默认)", str(len(p.models)))
+    console.print(table)
+
+
 # ── 帮助 & 状态 ──────────────────────────────────────────────────────
 
 
@@ -702,67 +756,23 @@ def _print_help():
     )
 
 
-def _print_status(c, provider: str):
+def _print_status(ctx):
+    reg = ctx.registry
+    c = ctx.config
+    p = reg.get_provider(reg.default_provider)
+    key_status = _key_status(c, reg.default_provider)
+    base_url = p.base_url if p else ""
     console.print(
         Panel.fit(
-            f"provider : [bold]{provider}[/bold]\n"
-            f"model    : [bold]{c.default_model}[/bold]\n"
-            f"agent    : [bold]{c.default_agent}[/bold]\n"
-            f"api_key  : {_key_status(c, provider)}\n"
-            f"base_url : {_get_base_url(c, provider) or '默认'}\n"
+            f"provider : [bold]{reg.default_provider}[/bold]\n"
+            f"model    : [bold]{reg.default_model}[/bold]\n"
+            f"api_key  : {key_status}\n"
+            f"base_url : {base_url or '默认'}\n"
             f"workspace: {c.workspace_root}",
             title="状态",
             border_style="green",
         )
     )
-
-
-def _model_picker(ctx):
-    """交互式模型选择器。"""
-    catalog = ctx.catalog
-    models = catalog.models
-    if not models:
-        console.print("[red]没有可用模型。[/red]")
-        return
-
-    table = Table(title="选择模型 (输入编号切换)")
-    table.add_column("#", style="dim")
-    table.add_column("模型")
-    table.add_column("Cost")
-    table.add_column("Cap")
-
-    for i, m in enumerate(models, 1):
-        cur = "●" if m.model_id == ctx.config.default_model else ""
-        table.add_row(
-            str(i),
-            f"{cur} {m.display_name} [dim]{m.model_id}[/dim]",
-            m.cost_tier, m.capability_tier,
-        )
-
-    console.print(table)
-    console.print("[dim]输入编号 / 关键词搜索 / Enter 取消[/dim]")
-    choice = console.input("模型 > ").strip()
-    if not choice:
-        return
-    if choice.isdigit():
-        idx = int(choice) - 1
-        if 0 <= idx < len(models):
-            ctx.config.default_model = models[idx].model_id
-            save_config(ctx.config)
-            console.print(f"[green]✓ {models[idx].display_name}[/green]")
-            return
-    matches = [m for m in models
-               if choice.lower() in m.model_id.lower()
-               or choice.lower() in m.display_name.lower()]
-    if len(matches) == 1:
-        ctx.config.default_model = matches[0].model_id
-        save_config(ctx.config)
-        console.print(f"[green]✓ {matches[0].display_name}[/green]")
-    elif len(matches) > 1:
-        for j, m in enumerate(matches, 1):
-            console.print(f"  [bold]{j}[/bold] {m.model_id}")
-    else:
-        console.print("[red]未找到匹配[/red]")
 
 
 if __name__ == "__main__":
