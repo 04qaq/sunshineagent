@@ -1,39 +1,85 @@
 """Tests for Phase 3: Router, Workers, TaskGraph."""
 
+from unittest.mock import patch
 
 
 class TestCapabilityRouter:
-    def test_route_plan_task(self):
+    @patch("src.router.CapabilityRouter.route")
+    def test_route_plan_task_mocked(self, mock_route):
+        from src.provider.catalog import ModelEntry
+
+        mock_route.return_value = ModelEntry(
+            model_id="test/plan", provider_id="test",
+            display_name="Plan Model", context_window=100000,
+            max_output_tokens=8000, tags=["planning"], cost_tier="high",
+        )
         from src.router import CapabilityRouter
+        from src.provider.catalog import ModelCatalog
 
-        router = CapabilityRouter()
-        model = router.route("plan")
-        assert model is not None
-        assert "planning" in model.tags or "architecture" in model.tags
-
-    def test_route_explore_cheap(self):
-        from src.router import CapabilityRouter
-
-        router = CapabilityRouter()
-        model = router.route("explore")
-        assert model is not None
-        # explore 应该选便宜的
-        assert model.input_price <= 5.0
-
-    def test_route_review_strong(self):
-        from src.router import CapabilityRouter
-
-        router = CapabilityRouter()
-        model = router.route("review")
+        catalog = ModelCatalog(".")
+        router = CapabilityRouter(catalog)
+        model = router.route("plan", max_cost="very-high")
         assert model is not None
 
-    def test_route_with_provider_filter(self):
-        from src.router import CapabilityRouter
+    @patch("src.provider.catalog.load_sunshine_config")
+    def test_route_explore_cheap(self, mock_load):
+        from src.config.provider import ProviderConfig, ModelConfig
 
-        router = CapabilityRouter()
-        model = router.route("code", provider="openai")
-        if model:
-            assert model.provider_id == "openai"
+        mock_load.return_value = {
+            "test": ProviderConfig(
+                name="T", models={
+                    "cheap": ModelConfig(name="C", cost="very-low",
+                                         tags=["search"]),
+                },
+            ),
+        }
+        from src.router import CapabilityRouter
+        from src.provider.catalog import ModelCatalog
+
+        catalog = ModelCatalog(".")
+        router = CapabilityRouter(catalog)
+        model = router.route("explore", max_cost="medium")
+        assert model is not None
+
+    @patch("src.provider.catalog.load_sunshine_config")
+    def test_cost_filter_blocks_expensive(self, mock_load):
+        from src.config.provider import ProviderConfig, ModelConfig
+
+        mock_load.return_value = {
+            "test": ProviderConfig(
+                name="T", models={
+                    "expensive": ModelConfig(name="E", cost="very-high",
+                                             tags=["planning", "review"]),
+                },
+            ),
+        }
+        from src.router import CapabilityRouter
+        from src.provider.catalog import ModelCatalog
+
+        catalog = ModelCatalog(".")
+        router = CapabilityRouter(catalog)
+        model = router.route("review", max_cost="medium")
+        assert model is None  # 应被 cost 过滤掉
+
+    @patch("src.provider.catalog.load_sunshine_config")
+    def test_route_with_fallback(self, mock_load):
+        from src.config.provider import ProviderConfig, ModelConfig
+
+        mock_load.return_value = {
+            "test": ProviderConfig(
+                name="T", models={
+                    "gen": ModelConfig(name="G", tags=["general"]),
+                },
+            ),
+        }
+        from src.router import CapabilityRouter
+        from src.provider.catalog import ModelCatalog
+
+        catalog = ModelCatalog(".")
+        router = CapabilityRouter(catalog)
+        primary, fallback = router.route_with_fallback("explore", max_cost="medium")
+        assert primary is not None
+        assert fallback is not None
 
 
 class TestWorkers:

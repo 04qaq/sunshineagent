@@ -8,6 +8,9 @@
   - review:   审查和验收（强模型）
 """
 
+from dataclasses import dataclass as _dc
+from dataclasses import field as _f
+
 from src.agent.agent import AgentInfo
 from src.agent.permissions import PermissionRuleset
 
@@ -136,3 +139,60 @@ WORKERS: dict[str, AgentInfo] = {
 def get_worker(task_type: str) -> AgentInfo:
     """按任务类型获取 Worker Agent。"""
     return WORKERS.get(task_type, CODE_WORKER)
+
+
+# ── 任务需求定义（供 CapabilityRouter 使用）─────────────────────────
+
+
+@_dc
+class TaskRequirement:
+    task_type: str = ""
+    capabilities: list[str] = _f(default_factory=list)
+    quality: str = "medium"
+    budget: str = "medium"
+
+
+TASK_REQUIREMENTS: dict[str, TaskRequirement] = {
+    "plan": TaskRequirement(
+        task_type="plan",
+        capabilities=["planning", "architecture", "reasoning"],
+        quality="high",
+        budget="high",
+    ),
+    "explore": TaskRequirement(
+        task_type="explore",
+        capabilities=["search"],
+        quality="low",
+        budget="low",
+    ),
+    "code": TaskRequirement(
+        task_type="code",
+        capabilities=["code_generation", "reasoning"],
+        quality="high",
+        budget="medium",
+    ),
+    "test": TaskRequirement(
+        task_type="test",
+        capabilities=["code_generation", "test"],
+        quality="medium",
+        budget="low",
+    ),
+    "review": TaskRequirement(
+        task_type="review",
+        capabilities=["review", "code_generation", "reasoning"],
+        quality="high",
+        budget="high",
+    ),
+    "document": TaskRequirement(
+        task_type="document",
+        capabilities=["document"],
+        quality="low",
+        budget="low",
+    ),
+    "general": TaskRequirement(
+        task_type="general",
+        capabilities=["code_generation", "reasoning", "general"],
+        quality="medium",
+        budget="medium",
+    ),
+}

@@ -34,6 +34,7 @@ from src.mcp import (
 )
 from src.models.database import Database
 from src.prompt.engine import SystemPromptEngine
+from src.provider.catalog import ModelCatalog
 from src.provider.factory import ProviderFactory
 from src.session.compaction import CompactionService
 from src.session.coordinator import RunCoordinator
@@ -73,6 +74,7 @@ class AppContext:
         self.agents: AgentRegistry | None = None
         self.tools: ToolRegistry | None = None
         self.provider_factory: ProviderFactory | None = None
+        self.catalog: ModelCatalog | None = None
         self.coordinator: RunCoordinator = RunCoordinator()
         self.jobs: BackgroundJobManager = BackgroundJobManager()
         self.system_engine: SystemPromptEngine | None = None
@@ -105,7 +107,8 @@ async def _init(ctx: AppContext, workspace: Path):
     ctx.sessions = SessionService(ctx.db)
     ctx.agents = AgentRegistry(ctx.db._session_factory)
     ctx.tools = ToolRegistry()
-    ctx.provider_factory = ProviderFactory()
+    ctx.catalog = ModelCatalog(c.workspace_root)
+    ctx.provider_factory = ProviderFactory(ctx.catalog)
     ctx.system_engine = SystemPromptEngine(c.prompts_dir)
     ctx.compaction = CompactionService(ctx.provider_factory, ctx.sessions)
     ctx.mcp = MCPClient()
@@ -460,11 +463,15 @@ async def _handle_command(
 
     if action == "/model":
         if not args:
-            console.print("[red]用法: /model <model-id>[/red]")
-            return None
+            _model_picker(ctx)
+            return "reload"
         c.default_model = args
         console.print(f"[green]✓ model = {args}[/green]")
         save_config(c)
+        return "reload"
+
+    if action == "/models":
+        _model_picker(ctx)
         return "reload"
 
     if action == "/provider":
@@ -700,6 +707,54 @@ def _print_status(c, provider: str):
             border_style="green",
         )
     )
+
+
+def _model_picker(ctx):
+    """交互式模型选择器。"""
+    catalog = ctx.catalog
+    models = catalog.models
+    if not models:
+        console.print("[red]没有可用模型。[/red]")
+        return
+
+    table = Table(title="选择模型 (输入编号切换)")
+    table.add_column("#", style="dim")
+    table.add_column("模型")
+    table.add_column("Cost")
+    table.add_column("Cap")
+
+    for i, m in enumerate(models, 1):
+        cur = "●" if m.model_id == ctx.config.default_model else ""
+        table.add_row(
+            str(i),
+            f"{cur} {m.display_name} [dim]{m.model_id}[/dim]",
+            m.cost_tier, m.capability_tier,
+        )
+
+    console.print(table)
+    console.print("[dim]输入编号 / 关键词搜索 / Enter 取消[/dim]")
+    choice = console.input("模型 > ").strip()
+    if not choice:
+        return
+    if choice.isdigit():
+        idx = int(choice) - 1
+        if 0 <= idx < len(models):
+            ctx.config.default_model = models[idx].model_id
+            save_config(ctx.config)
+            console.print(f"[green]✓ {models[idx].display_name}[/green]")
+            return
+    matches = [m for m in models
+               if choice.lower() in m.model_id.lower()
+               or choice.lower() in m.display_name.lower()]
+    if len(matches) == 1:
+        ctx.config.default_model = matches[0].model_id
+        save_config(ctx.config)
+        console.print(f"[green]✓ {matches[0].display_name}[/green]")
+    elif len(matches) > 1:
+        for j, m in enumerate(matches, 1):
+            console.print(f"  [bold]{j}[/bold] {m.model_id}")
+    else:
+        console.print("[red]未找到匹配[/red]")
 
 
 if __name__ == "__main__":
