@@ -12,7 +12,10 @@ class OpenAIClient(ProviderClient):
     provider_id = "openai"
 
     def __init__(self, api_key: str | None = None, base_url: str | None = None):
-        self._client = AsyncOpenAI(api_key=api_key, base_url=base_url)
+        self._client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url or None,
+        )
 
     async def stream(
         self,
@@ -26,9 +29,7 @@ class OpenAIClient(ProviderClient):
     ) -> AsyncIterator[StreamEvent]:
         openai_tools = None
         if tools:
-            openai_tools = [{"type": "function", "function": t} for t in tools]
-            # handle anthropic-format tools if needed
-            if isinstance(tools[0], dict) and "input_schema" in tools[0]:
+            if "input_schema" in tools[0]:
                 openai_tools = [
                     {
                         "type": "function",
@@ -39,6 +40,10 @@ class OpenAIClient(ProviderClient):
                         },
                     }
                     for t in tools
+                ]
+            else:
+                openai_tools = [
+                    {"type": "function", "function": t} for t in tools
                 ]
 
         stream = await self._client.chat.completions.create(
@@ -52,14 +57,18 @@ class OpenAIClient(ProviderClient):
         )
 
         tool_call_buffer: dict[int, dict] = {}
+        final_finish: str | None = None
+        final_usage: dict | None = None
 
         async for chunk in stream:
+            if not chunk.choices:
+                continue
             delta = chunk.choices[0].delta
 
-            if delta.content:
+            if delta and delta.content:
                 yield StreamEvent(type="text_delta", text=delta.content)
 
-            if delta.tool_calls:
+            if delta and delta.tool_calls:
                 for tc in delta.tool_calls:
                     idx = tc.index
                     if idx not in tool_call_buffer:
@@ -77,19 +86,25 @@ class OpenAIClient(ProviderClient):
                         if tc.function.arguments:
                             buf["args"] += tc.function.arguments
 
-            if chunk.choices[0].finish_reason:
-                for buf in tool_call_buffer.values():
-                    yield StreamEvent(
-                        type="tool_call_start",
-                        tool_call_id=buf["id"],
-                        tool_name=buf["name"],
-                        args=buf["args"],
-                    )
+            fr = chunk.choices[0].finish_reason
+            if fr is not None:
+                final_finish = fr
+                final_usage = chunk.usage.model_dump() if chunk.usage else None
+
+        # 流结束后，输出累积的 tool_calls 和 finish 事件
+        for buf in tool_call_buffer.values():
+            if buf["id"]:
                 yield StreamEvent(
-                    type="finish",
-                    finish_reason=chunk.choices[0].finish_reason,
-                    usage=chunk.usage.model_dump() if chunk.usage else None,
+                    type="tool_call_start",
+                    tool_call_id=buf["id"],
+                    tool_name=buf["name"],
+                    args=buf["args"],
                 )
+        yield StreamEvent(
+            type="finish",
+            finish_reason=final_finish or "stop",
+            usage=final_usage,
+        )
 
     async def generate_object(
         self,

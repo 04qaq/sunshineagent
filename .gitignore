@@ -27,6 +27,10 @@ node_modules/
 
 # 参考源码，不纳入版本控制
 docs/参考源码/
+
+# 本地配置和数据
+.sunshine/
+.venv/
 .DS_Store
 Thumbs.db
 

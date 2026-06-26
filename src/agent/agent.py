@@ -5,11 +5,9 @@ Ownership: Human module. This is a stub until the human implements it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
 
-if TYPE_CHECKING:
-    from src.agent.permissions import PermissionRuleset
+from src.agent.permissions import PermissionRuleset
 
 
 @dataclass
@@ -19,7 +17,7 @@ class AgentInfo:
     native: bool = True
     hidden: bool = False
 
-    permission: PermissionRuleset | None = None
+    permission: PermissionRuleset = field(default_factory=PermissionRuleset.default)
 
     system_prompt: str | None = None
     provider_id: str | None = None

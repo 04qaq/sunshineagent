@@ -5,11 +5,12 @@ Ownership: Human module. This is a stub until the human implements it.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from ulid import ULID
 
 from src.models.database import Base
 
@@ -20,7 +21,7 @@ if TYPE_CHECKING:
 class Message(Base):
     __tablename__ = "messages"
 
-    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    id: Mapped[str] = mapped_column(String(32), primary_key=True,default=lambda:f"msg_{ULID()}")
     session_id: Mapped[str] = mapped_column(
         String(32), ForeignKey("sessions.id"), index=True
     )
@@ -33,7 +34,7 @@ class Message(Base):
     finish_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
     usage: Mapped[str | None] = mapped_column(Text, nullable=True)
 
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda:datetime.now(UTC))
     compacted: Mapped[bool] = mapped_column(Boolean, default=False)
 
     session: Mapped[Session] = relationship(back_populates="messages")

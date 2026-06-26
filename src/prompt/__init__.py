@@ -1,6 +1,7 @@
 """Prompt engine for SunshineAgent.
 
-Ownership: Human module. This file provides stubs until the human implements it.
+OWNER: Human
+SKILL: Jinja2 templates
 """
 
 from src.prompt.engine import SystemPromptEngine

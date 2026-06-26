@@ -1,5 +1,6 @@
 """Tests for the tool system."""
 
+import json
 
 from src.tool.base import Tool, ToolContext, ToolRegistry, ToolResult
 
@@ -75,7 +76,39 @@ class TestBashTool:
         assert "hello" in result.output
 
 
-class TestGrepTool:
+class TestMessageConversion:
+    def test_openai_message_order(self):
+        """确保 assistant 消息在 tool_result 之前。"""
+        from src.agent.loop import AgentLoop
+
+        class MockMsg:
+            def __init__(self, role, parts_str):
+                self.role = role
+                self.parts = parts_str
+
+        messages = [
+            MockMsg("user", json.dumps([{"type": "text", "text": "hello"}])),
+            MockMsg(
+                "assistant",
+                json.dumps([
+                    {"type": "text", "text": "let me read"},
+                    {"type": "tool_call", "tool_call_id": "t1",
+                     "tool_name": "read", "args": {"filePath": "/x"}},
+                    {"type": "tool_result", "tool_call_id": "t1",
+                     "output": "contents", "is_error": False},
+                ]),
+            ),
+        ]
+
+        result = AgentLoop._to_openai_messages(messages)
+        roles = [m["role"] for m in result]
+        # 顺序应为: user, assistant, tool
+        assert roles == ["user", "assistant", "tool"], f"unexpected order: {roles}"
+        # tool 消息必须有 tool_call_id
+        assert result[2]["tool_call_id"] == "t1"
+        # assistant 消息必须有 tool_calls
+        assert "tool_calls" in result[1]
+        assert result[1]["tool_calls"][0]["id"] == "t1"
     async def test_grep_match(self, tmp_path):
         from src.tool.grep import GrepTool
 

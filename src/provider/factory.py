@@ -16,7 +16,10 @@ class ProviderFactory:
             return self._clients[provider_id]
 
         if provider_id == "anthropic":
-            client = AnthropicClient(api_key=self._config.anthropic_api_key)
+            client = AnthropicClient(
+                api_key=self._config.anthropic_api_key,
+                base_url=self._config.anthropic_base_url,
+            )
         elif provider_id == "openai":
             client = OpenAIClient(
                 api_key=self._config.openai_api_key,

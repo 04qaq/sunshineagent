@@ -11,8 +11,11 @@ from src.provider.base import ProviderClient, StreamEvent
 class AnthropicClient(ProviderClient):
     provider_id = "anthropic"
 
-    def __init__(self, api_key: str | None = None):
-        self._client = AsyncAnthropic(api_key=api_key)
+    def __init__(self, api_key: str | None = None, base_url: str | None = None):
+        self._client = AsyncAnthropic(
+            api_key=api_key,
+            base_url=base_url or None,
+        )
 
     async def stream(
         self,
@@ -32,6 +35,7 @@ class AnthropicClient(ProviderClient):
             max_tokens=max_tokens or 16384,
             temperature=temperature,
         ) as stream:
+            stopped = False
             async for event in stream:
                 if event.type == "text":
                     yield StreamEvent(type="text_delta", text=event.text)
@@ -43,6 +47,7 @@ class AnthropicClient(ProviderClient):
                         args=json.dumps(event.input),
                     )
                 elif event.type == "message_stop":
+                    stopped = True
                     usage = None
                     if stream.usage:
                         usage = {
@@ -54,6 +59,12 @@ class AnthropicClient(ProviderClient):
                         finish_reason="stop",
                         usage=usage,
                     )
+            # 安全网：stream 结束时未收到 message_stop
+            if not stopped:
+                yield StreamEvent(
+                    type="finish",
+                    finish_reason="stop",
+                )
 
     async def generate_object(
         self,

@@ -1,6 +1,9 @@
 """CLI entrypoint for SunshineAgent.
 
-Ownership: Human module. This file provides stubs until the human implements it.
+OWNER: Human
+SKILL: Typer, Rich
 """
 
-__all__: list[str] = []
+from src.cli.main import app
+
+__all__ = ["app"]
