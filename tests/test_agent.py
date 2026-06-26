@@ -43,15 +43,16 @@ class TestPermissionRuleset:
 
 
 class TestBuiltinAgents:
-    def test_has_seven_agents(self):
-        assert len(BUILTIN_AGENTS) == 7
+    def test_has_eleven_agents(self):
+        assert len(BUILTIN_AGENTS) == 11
         assert "build" in BUILTIN_AGENTS
         assert "plan" in BUILTIN_AGENTS
         assert "general" in BUILTIN_AGENTS
         assert "explore" in BUILTIN_AGENTS
-        assert "compaction" in BUILTIN_AGENTS
-        assert "title" in BUILTIN_AGENTS
-        assert "summary" in BUILTIN_AGENTS
+        assert "code" in BUILTIN_AGENTS
+        assert "test" in BUILTIN_AGENTS
+        assert "document" in BUILTIN_AGENTS
+        assert "review" in BUILTIN_AGENTS
 
     def test_build_agent_has_all_permissions(self):
         build = BUILTIN_AGENTS["build"]

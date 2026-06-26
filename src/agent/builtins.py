@@ -2,6 +2,7 @@
 
 from src.agent.agent import AgentInfo
 from src.agent.permissions import PermissionRuleset
+from src.agent.workers import CODE_WORKER, DOCUMENT_WORKER, REVIEW_WORKER, TEST_WORKER
 
 BUILD_AGENT = AgentInfo(
     name="build",
@@ -61,6 +62,10 @@ BUILTIN_AGENTS: dict[str, AgentInfo] = {
     "compaction": COMPACTION_AGENT,
     "title": TITLE_AGENT,
     "summary": SUMMARY_AGENT,
+    "code": CODE_WORKER,
+    "test": TEST_WORKER,
+    "document": DOCUMENT_WORKER,
+    "review": REVIEW_WORKER,
 }
 
 
