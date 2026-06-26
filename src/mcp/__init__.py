@@ -1,6 +1,10 @@
 """MCP (Model Context Protocol) 集成。
 
-通过 stdio 连接外部 MCP server，发现工具并注册到 ToolRegistry。
+支持全局 MCP 和项目 MCP 的分层管理：
+  - ~/.sunshine/mcp/  → 全局 MCP（需手动 enable 到项目）
+  - <workspace>/.sunshine/mcp/  → 项目 MCP（自动加载，Agent 可见）
+
+每个 .json 文件定义一个 MCP server，拖入目录即生效。
 """
 
 import contextlib
@@ -16,26 +20,17 @@ from src.tool.base import Tool, ToolContext, ToolResult
 
 @dataclass
 class MCPServerConfig:
-    """单个 MCP server 的启动配置。
-
-    对应 OpenCode 的 MCP server 定义：
-    - name: 唯一标识符，用于拼接工具名 mcp__<name>__<tool>
-    - command: 可执行命令 (如 "node", "python")
-    - args: 命令参数 (如 ["server.js"])
-    """
+    """单个 MCP server 配置。"""
 
     name: str
     command: str
     args: list[str] = field(default_factory=list)
     env: dict = field(default_factory=dict)
+    source: str = ""  # "global" | "project"
 
 
 class MCPTool(Tool):
-    """MCP 工具的 Tool 子类包装器。
-
-    将 MCP server 发现的工具包装为 SunshineAgent Tool 接口，
-    使权限系统和 ToolRegistry 可以统一管理。
-    """
+    """MCP 工具包装器。"""
 
     name = ""
     description = ""
@@ -59,27 +54,14 @@ class MCPTool(Tool):
 
     async def execute(self, params: dict, ctx: ToolContext) -> ToolResult:
         try:
-            result = await self._client.call_tool(
-                self._server, self._original, params
-            )
+            result = await self._client.call_tool(self._server, self._original, params)
             return ToolResult(output=result)
         except Exception as e:
             return ToolResult(output=f"MCP tool error: {e}")
 
 
 class MCPClient:
-    """MCP 客户端 —— 管理多个 MCP server 的连接、工具发现和调用。
-
-    对应 OpenCode mcp/index.ts。
-
-    使用方式：
-        client = MCPClient()
-        await client.connect(MCPServerConfig(
-            name="filesystem", command="npx",
-            args=["-y", "@modelcontextprotocol/server-filesystem", "."]
-        ))
-        tools = client.list_tools()  # → 可注册到 ToolRegistry
-    """
+    """MCP 客户端 —— 管理多个 MCP server 的连接。"""
 
     def __init__(self):
         self._sessions: dict[str, ClientSession] = {}
@@ -87,7 +69,7 @@ class MCPClient:
         self._tools: dict[str, dict] = {}
 
     async def connect(self, config: MCPServerConfig) -> list[MCPTool]:
-        """连接 MCP server，发现工具并返回 MCPTool 列表。"""
+        """连接 MCP server，发现工具。"""
         server_params = StdioServerParameters(
             command=config.command,
             args=config.args,
@@ -106,19 +88,18 @@ class MCPClient:
         tools = []
         for t in result.tools:
             full_name = f"mcp__{config.name}__{t.name}"
-            tool_def = {
+            self._tools[full_name] = {
                 "name": full_name,
                 "description": t.description or full_name,
                 "input_schema": t.inputSchema or {},
                 "server": config.name,
                 "original_name": t.name,
             }
-            self._tools[full_name] = tool_def
             tools.append(
                 MCPTool(
                     name=full_name,
-                    description=tool_def["description"],
-                    input_schema=tool_def["input_schema"],
+                    description=t.description or full_name,
+                    input_schema=t.inputSchema or {},
                     server_name=config.name,
                     original_name=t.name,
                     mcp_client=self,
@@ -135,7 +116,7 @@ class MCPClient:
         return json.dumps(result.content, ensure_ascii=False)
 
     def list_tools(self) -> list[dict]:
-        """列出所有已发现的 MCP 工具定义。"""
+        """列出所有已连接的 MCP 工具。"""
         return list(self._tools.values())
 
     async def disconnect(self, name: str):
@@ -146,9 +127,7 @@ class MCPClient:
                 del self._sessions[name]
         if name in self._transports:
             del self._transports[name]
-        self._tools = {
-            k: v for k, v in self._tools.items() if v["server"] != name
-        }
+        self._tools = {k: v for k, v in self._tools.items() if v["server"] != name}
 
     async def disconnect_all(self):
         """断开所有 MCP server。"""
@@ -156,39 +135,84 @@ class MCPClient:
             await self.disconnect(name)
 
 
-def load_mcp_config(path: str | None = None) -> list[MCPServerConfig]:
-    """从 JSON 配置文件加载 MCP server 配置。
+# ── 配置扫描 ───────────────────────────────────────────────────────────
 
-    默认路径：~/.sunshine/mcp.json
 
-    格式：
-    {
-      "servers": [
-        {
-          "name": "filesystem",
-          "command": "npx",
-          "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
-          "env": {}
-        }
-      ]
-    }
-    """
-    filepath = Path(path) if path else Path.home() / ".sunshine" / "mcp.json"
-    if not filepath.exists():
-        return []
+def _scan_mcp_dir(directory: Path, source: str) -> list[MCPServerConfig]:
+    """扫描目录中的 .json 文件，解析为 MCP server 配置列表。"""
+    configs: list[MCPServerConfig] = []
+    if not directory.exists():
+        return configs
 
-    with open(filepath, encoding="utf-8") as f:
-        data = json.load(f)
-
-    servers = data.get("servers", data.get("mcpServers", []))
-    configs = []
-    for s in servers:
-        configs.append(
-            MCPServerConfig(
-                name=s["name"],
-                command=s["command"],
-                args=s.get("args", []),
-                env=s.get("env", {}),
-            )
-        )
+    for f in sorted(directory.glob("*.json")):
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            # 支持单文件单个 server 和单文件多个 servers 两种格式
+            items = data.get("servers", [data] if "name" in data else [])
+            for item in items:
+                if "name" not in item or "command" not in item:
+                    continue
+                configs.append(
+                    MCPServerConfig(
+                        name=item["name"],
+                        command=item["command"],
+                        args=item.get("args", []),
+                        env=item.get("env", {}),
+                        source=source,
+                    )
+                )
+        except Exception:
+            pass
     return configs
+
+
+def _mcp_dir_global() -> Path:
+    return Path.home() / ".sunshine" / "mcp"
+
+
+def _mcp_dir_project(workspace: str) -> Path:
+    return Path(workspace) / ".sunshine" / "mcp"
+
+
+def load_global_configs() -> list[MCPServerConfig]:
+    """扫描全局 MCP 配置（~/.sunshine/mcp/*.json）。"""
+    return _scan_mcp_dir(_mcp_dir_global(), "global")
+
+
+def load_project_configs(workspace: str) -> list[MCPServerConfig]:
+    """扫描项目 MCP 配置（<workspace>/.sunshine/mcp/*.json）。"""
+    return _scan_mcp_dir(_mcp_dir_project(workspace), "project")
+
+
+def load_all_configs(workspace: str) -> list[MCPServerConfig]:
+    """加载所有 MCP 配置：全局 + 项目。"""
+    return load_global_configs() + load_project_configs(workspace)
+
+
+def save_mcp_config(config: MCPServerConfig) -> Path:
+    """保存 MCP 配置到磁盘。"""
+    directory = (
+        _mcp_dir_global() if config.source == "global"
+        else _mcp_dir_project(Path(config.env.get("_workspace", "")).as_posix())
+        if config.env.get("_workspace")
+        else _mcp_dir_global()
+    )
+    directory.mkdir(parents=True, exist_ok=True)
+    filepath = directory / f"{config.name}.json"
+    data = {
+        "name": config.name,
+        "command": config.command,
+        "args": config.args,
+    }
+    filepath.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    return filepath
+
+
+def remove_mcp_config(name: str, workspace: str) -> bool:
+    """删除 MCP 配置文件。先查项目，再查全局。"""
+    for directory in [_mcp_dir_project(workspace), _mcp_dir_global()]:
+        filepath = directory / f"{name}.json"
+        if filepath.exists():
+            filepath.unlink()
+            return True
+    return False

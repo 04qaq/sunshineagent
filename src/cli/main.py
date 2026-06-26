@@ -24,7 +24,14 @@ from src.agent.loop import AgentLoop, SessionContext
 from src.agent.permissions import PermissionRuleset
 from src.background import BackgroundJobManager
 from src.config.config import get_config, load_config, save_config
-from src.mcp import MCPClient, load_mcp_config
+from src.mcp import (
+    MCPClient,
+    MCPServerConfig,
+    load_all_configs,
+    load_project_configs,
+    remove_mcp_config,
+    save_mcp_config,
+)
 from src.models.database import Database
 from src.prompt.engine import SystemPromptEngine
 from src.provider.factory import ProviderFactory
@@ -73,6 +80,7 @@ class AppContext:
         self.mcp: MCPClient | None = None
         self._current_session_id: str | None = None
         self._loop_factory = None
+        self._mcp_configs: list[MCPServerConfig] = []
 
     @property
     def current_session_id(self) -> str | None:
@@ -104,16 +112,23 @@ async def _init(ctx: AppContext, workspace: Path):
 
     _register_tools(ctx, workspace)
 
-    # 连接 MCP servers
-    mcp_configs = load_mcp_config()
-    for mcfg in mcp_configs:
+    # 连接项目 MCP servers（自动加载，Agent 可见）
+    project_mcp = load_project_configs(c.workspace_root)
+    for mcfg in project_mcp:
         try:
             mcp_tools = await ctx.mcp.connect(mcfg)
             for mt in mcp_tools:
                 ctx.tools.register(mt)
+            ctx._mcp_configs.append(mcfg)
             console.print(f"[dim]MCP: {mcfg.name} — {len(mcp_tools)} tools[/dim]")
         except Exception as e:
             console.print(f"[yellow]MCP {mcfg.name}: {e}[/yellow]")
+
+    # 加载全局 MCP 配置（仅存储，不自动连接）
+    global_mcp = load_all_configs(c.workspace_root)
+    for mcfg in global_mcp:
+        if mcfg.source == "global" and mcfg.name not in {c.name for c in ctx._mcp_configs}:
+            ctx._mcp_configs.append(mcfg)
 
 
 def _register_tools(ctx: AppContext, workspace: Path):
@@ -521,8 +536,124 @@ async def _handle_command(
         console.print(f"[green]✓ 已恢复到会话 {args}[/green]")
         return None
 
+    if action == "/mcp":
+        if not args or args == "list":
+            _mcp_list(ctx)
+            return None
+        parts2 = args.split(maxsplit=1)
+        sub = parts2[0].lower()
+        rest = parts2[1] if len(parts2) > 1 else ""
+        if sub == "enable":
+            await _mcp_enable(ctx, rest)
+        elif sub == "disable":
+            await _mcp_disable(ctx, rest)
+        elif sub == "add":
+            global_ = False
+            add_args = rest
+            if rest.startswith("--global "):
+                global_ = True
+                add_args = rest[len("--global "):]
+            elif rest == "--global":
+                console.print("[red]用法: /mcp add --global <name> <command> [args...][/red]")
+                return None
+            await _mcp_add(ctx, add_args, global_=global_)
+        elif sub == "remove":
+            await _mcp_remove(ctx, rest)
+        else:
+            _mcp_list(ctx)
+        return None
+
     console.print(f"[red]未知命令: {action}[/red] 输入 /help 查看帮助")
     return None
+
+
+# ── MCP 管理 ─────────────────────────────────────────────────────────
+
+
+def _mcp_list(ctx: AppContext):
+    """列出所有 MCP server：启用的（已连接）+ 待启用的。"""
+    active = {t.get("server", "") for t in ctx.mcp.list_tools()}
+    if not ctx._mcp_configs:
+        console.print("[dim]没有 MCP server 配置[/dim]")
+        console.print("拖 .json 文件到 .sunshine/mcp/ 目录，或用 [bold]/mcp add[/bold]")
+        return
+
+    table = Table(title="MCP Servers")
+    table.add_column("状态")
+    table.add_column("名称")
+    table.add_column("来源")
+    table.add_column("命令")
+    for cfg in ctx._mcp_configs:
+        status = "[green]✓ 启用[/green]" if cfg.name in active else "[dim]○ 待启用[/dim]"
+        src = "全局" if cfg.source == "global" else "项目"
+        table.add_row(status, cfg.name, src, f"{cfg.command} {' '.join(cfg.args)}")
+    console.print(table)
+    if any(cfg.name not in active for cfg in ctx._mcp_configs):
+        console.print("[dim]/mcp enable <name> 启用  /mcp disable <name> 禁用[/dim]")
+
+
+async def _mcp_enable(ctx: AppContext, name: str):
+    """启用全局 MCP 到当前项目。"""
+    cfg = next((c for c in ctx._mcp_configs if c.name == name and c.name not in
+                {t.get("server", "") for t in ctx.mcp.list_tools()}), None)
+    if not cfg:
+        console.print(f"[red]{name} 未找到或已启用[/red]")
+        return
+    try:
+        tools = await ctx.mcp.connect(cfg)
+        for mt in tools:
+            ctx.tools.register(mt)
+        console.print(f"[green]✓ {name} — {len(tools)} tools[/green]")
+    except Exception as e:
+        console.print(f"[red]启用失败: {e}[/red]")
+
+
+async def _mcp_disable(ctx: AppContext, name: str):
+    """禁用 MCP（不断开连接在 init 中的配置，只移除已连接的）。"""
+    await ctx.mcp.disconnect(name)
+    console.print(f"[green]✓ {name} 已禁用[/green]")
+
+
+async def _mcp_add(ctx: AppContext, args: str, global_: bool = False):
+    """添加 MCP server 配置并自动连接。"""
+    if not args:
+        console.print("[red]用法: /mcp add <name> <command> [arg1 arg2 ...][/red]")
+        return
+    parts = args.split()
+    if len(parts) < 2:
+        console.print("[red]至少需要 name 和 command[/red]")
+        return
+    name = parts[0]
+    command = parts[1]
+    cmd_args = parts[2:] if len(parts) > 2 else []
+    source = "global" if global_ else "project"
+    workspace = ctx.config.workspace_root if not global_ else ""
+    config = MCPServerConfig(name=name, command=command, args=cmd_args, source=source)
+    try:
+        tools = await ctx.mcp.connect(config)
+        for mt in tools:
+            ctx.tools.register(mt)
+        # 持久化
+        if global_:
+            config.source = "global"
+        else:
+            config.env = {"_workspace": workspace}
+        save_mcp_config(config)
+        ctx._mcp_configs.append(config)
+        console.print(f"[green]✓ MCP {name} ({source}) — {len(tools)} tools[/green]")
+    except Exception as e:
+        console.print(f"[red]连接失败: {e}[/red]")
+
+
+async def _mcp_remove(ctx: AppContext, name: str):
+    """删除 MCP 配置并断开连接。"""
+    if not name:
+        console.print("[red]用法: /mcp remove <name>[/red]")
+        return
+    await ctx.mcp.disconnect(name)
+    ctx._mcp_configs = [c for c in ctx._mcp_configs if c.name != name]
+    remove_mcp_config(name, ctx.config.workspace_root)
+    console.print(f"[green]✓ MCP server {name} 已删除[/green]")
 
 
 # ── 帮助 & 状态 ──────────────────────────────────────────────────────
@@ -543,6 +674,12 @@ def _print_help():
             "[bold]/clear[/bold], /new         开始新会话\n"
             "[bold]/sessions[/bold]            列出最近会话\n"
             "[bold]/resume <id>[/bold]         恢复指定会话\n\n"
+            "[bold]/mcp[/bold]                 列出所有 MCP server\n"
+            "[bold]/mcp enable <name>[/bold]   启用全局 MCP 到项目\n"
+            "[bold]/mcp disable <name>[/bold]  禁用 MCP（保留配置）\n"
+            "[bold]/mcp add <n> <cmd> [a][/bold] 添加项目 MCP\n"
+            "[bold]/mcp add --global <n> <cmd> [a][/bold] 添加全局 MCP\n"
+            "[bold]/mcp remove <name>[/bold]   删除 MCP\n\n"
             "直接输入内容则发送给 Agent",
             title="帮助",
             border_style="blue",
