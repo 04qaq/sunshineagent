@@ -262,8 +262,8 @@ def _merge_config_file(providers: dict[str, ProviderConfig], path: Path):
         "anthropic_base_url": ("anthropic", "base_url"),
     }
     for flat_key, (prov_id, attr) in provider_key_map.items():
-        value = data.get(flat_key, "")
-        if value:
+        value = data.get(flat_key)
+        if value is not None and value != "":
             if prov_id not in providers:
                 providers[prov_id] = ProviderConfig(name=prov_id)
             setattr(providers[prov_id], attr, value)

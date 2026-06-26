@@ -448,6 +448,9 @@ async def _handle_command(
         else:
             console.print(f"[red]未知 provider: {prov}[/red]")
             return None
+        # 同步更新 provider catalog
+        if ctx.catalog and prov in ctx.catalog.providers:
+            ctx.catalog.providers[prov].api_key = key
         ctx.provider_factory._clients.clear()
         console.print(f"[green]✓ {prov} API key 已设置[/green]")
         save_config(c)
@@ -456,6 +459,11 @@ async def _handle_command(
     if action == "/baseurl":
         c.openai_base_url = args if args else None
         c.anthropic_base_url = args if args else None
+        # 同步更新 provider catalog
+        if ctx.catalog and c.default_provider in ctx.catalog.providers:
+            ctx.catalog.providers[c.default_provider].base_url = args or ""
+        if args and ctx.catalog and "anthropic" in ctx.catalog.providers:
+            ctx.catalog.providers["anthropic"].base_url = args or ""
         ctx.provider_factory._clients.clear()
         console.print(f"[green]✓ base_url = {args or '默认（已清除）'}[/green]")
         save_config(c)
