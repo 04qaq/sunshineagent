@@ -59,11 +59,24 @@ def save_config(settings: Settings):
         "default_agent": settings.default_agent,
         "default_provider": settings.default_provider,
         "default_model": settings.default_model,
+        # 旧版兼容（扁平 key）
         "openai_api_key": settings.openai_api_key,
         "openai_base_url": settings.openai_base_url,
         "anthropic_api_key": settings.anthropic_api_key,
         "anthropic_base_url": settings.anthropic_base_url,
+        # 新版 providers 格式
+        "providers": {},
     }
+    if settings.openai_api_key or settings.openai_base_url:
+        data["providers"]["openai"] = {
+            "base_url": settings.openai_base_url or "",
+            "api_key": settings.openai_api_key or "",
+        }
+    if settings.anthropic_api_key or settings.anthropic_base_url:
+        data["providers"]["anthropic"] = {
+            "base_url": settings.anthropic_base_url or "",
+            "api_key": settings.anthropic_api_key or "",
+        }
     path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 
 

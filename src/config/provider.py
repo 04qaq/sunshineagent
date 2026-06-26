@@ -218,24 +218,28 @@ def load_sunshine_config(workspace: str) -> dict[str, ProviderConfig]:
 
 
 def _merge_config_file(providers: dict[str, ProviderConfig], path: Path):
-    """将 config.json 合并到 providers。"""
+    """将 config.json 合并到 providers。
+
+    支持两种格式：
+      新版：{"providers": {"openai": {"base_url": "...", "api_key": "..."}}}
+      旧版：{"openai_api_key": "sk-xxx", "openai_base_url": "..."}
+    """
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return
 
+    # 新版格式：嵌套 providers
     cfg_providers = data.get("providers", data.get("provider", {}))
     if isinstance(cfg_providers, dict):
         for prov_id, prov_data in cfg_providers.items():
             if prov_id not in providers:
                 providers[prov_id] = ProviderConfig(name=prov_data.get("name", prov_id))
             p = providers[prov_id]
-
             if "base_url" in prov_data:
                 p.base_url = prov_data["base_url"]
             if "api_key" in prov_data:
                 p.api_key = _resolve_env(prov_data["api_key"])
-
             models = prov_data.get("models", {})
             if isinstance(models, dict):
                 for model_id, model_data in models.items():
@@ -249,6 +253,20 @@ def _merge_config_file(providers: dict[str, ProviderConfig], path: Path):
                         supports_tools=model_data.get("supports_tools", True),
                         tags=model_data.get("tags", []),
                     )
+
+    # 旧版格式：扁平 key → 映射到 provider
+    provider_key_map = {
+        "openai_api_key": ("openai", "api_key"),
+        "openai_base_url": ("openai", "base_url"),
+        "anthropic_api_key": ("anthropic", "api_key"),
+        "anthropic_base_url": ("anthropic", "base_url"),
+    }
+    for flat_key, (prov_id, attr) in provider_key_map.items():
+        value = data.get(flat_key, "")
+        if value:
+            if prov_id not in providers:
+                providers[prov_id] = ProviderConfig(name=prov_id)
+            setattr(providers[prov_id], attr, value)
 
 
 def save_sunshine_config(workspace: str, providers: dict[str, ProviderConfig]):
