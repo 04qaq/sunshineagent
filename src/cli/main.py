@@ -23,6 +23,10 @@ from src.agent.builtins import AgentRegistry
 from src.agent.loop import AgentLoop, SessionContext
 from src.agent.permissions import PermissionRuleset
 from src.background import BackgroundJobManager
+from src.cli.permission_ui import PermissionUI, QuestionUI
+from src.cli.prompt import PromptHistory, PromptInput, PromptParser
+from src.cli.queue import PromptQueue
+from src.cli.status_bar import StatusBar
 from src.config.config import get_config, load_config, save_config
 from src.mcp import (
     MCPClient,
@@ -34,13 +38,13 @@ from src.mcp import (
 )
 from src.models.database import Database
 from src.prompt.engine import SystemPromptEngine
-from src.skill import SkillLoader
 from src.provider.factory import ProviderFactory
 from src.provider.registry import ProviderRegistry
 from src.provider.router import ModelRouter
 from src.session.compaction import CompactionService
 from src.session.coordinator import RunCoordinator
 from src.session.service import SessionService
+from src.skill import SkillLoader
 from src.tool.apply_patch import ApplyPatchTool
 from src.tool.base import ToolRegistry
 from src.tool.bash import BashTool
@@ -85,6 +89,13 @@ class AppContext:
         self._current_session_id: str | None = None
         self._loop_factory = None
         self._mcp_configs: list[MCPServerConfig] = []
+
+        # 新增：交互组件
+        self.history: PromptHistory = PromptHistory()
+        self.status_bar: StatusBar = StatusBar()
+        self.permission_ui: PermissionUI = PermissionUI(console)
+        self.question_ui: QuestionUI = QuestionUI(console)
+        self.queue: PromptQueue | None = None
 
     @property
     def current_session_id(self) -> str | None:
@@ -207,9 +218,19 @@ async def _send_prompt(
         )
         ctx._current_session_id = session.id
 
+    # 解析提示中的引用（用于后续处理文件附件等）
+    PromptParser.parse(prompt, c.workspace_root)
+
     await ctx.sessions.create_message(
         ctx._current_session_id, "user", parts=[{"type": "text", "text": prompt}]
     )
+
+    # 更新状态栏
+    ctx.status_bar.agent = _agent
+    ctx.status_bar.model = raw_model
+    ctx.status_bar.provider = _provider
+    ctx.status_bar.session_id = ctx._current_session_id or ""
+    ctx.status_bar.start()
 
     def _on_text(text: str):
         if not quiet:
@@ -234,8 +255,15 @@ async def _send_prompt(
 
     loop = ctx.make_loop()
     result_msg_id = await loop.run(sctx)
+
+    # 停止状态栏
+    ctx.status_bar.stop()
+
     if not quiet:
         console.print()
+        # 显示状态栏
+        console.print(f"[dim]{ctx.status_bar.render()}[/dim]")
+
     return result_msg_id
 
 
@@ -356,13 +384,17 @@ async def _repl_async(
     _model = reg.default_model
     _provider = reg.default_provider
 
+    # 设置已知 Agent 名称
+    known_agents = {a.name for a in app_ctx.agents.list(include_hidden=True)}
+    PromptParser.set_known_agents(known_agents)
+
     console.clear()
     console.print(
         Panel.fit(
             "[bold cyan]SunshineAgent[/bold cyan]\n"
             "[dim]输入 prompt 开始对话  [/dim]"
             "[bold]/help[/bold] 帮助  [bold]/exit[/bold] 退出  "
-            "[bold]Ctrl+C[/bold] 中断",
+            "[bold]Ctrl+C[/bold] 中断  [bold]↑↓[/bold] 历史",
             title="Sunshine",
             border_style="cyan",
         )
@@ -373,38 +405,64 @@ async def _repl_async(
     def _on_sigint():
         if not abort.is_set():
             abort.set()
+            app_ctx.status_bar.increment_interrupt()
             console.print("\n[dim]中断信号已发送，等待 agent 停止...[/dim]")
 
     with contextlib.suppress(ValueError):
         signal.signal(signal.SIGINT, lambda s, f: _on_sigint())
 
+    # 初始化 Prompt Queue
+    async def _run_prompt(prompt_input: PromptInput, abort_signal: asyncio.Event):
+        await _send_prompt(
+            app_ctx, prompt_input.text,
+            agent_name=_agent, model_id=_model, provider_id=_provider,
+            steps=steps, abort=abort_signal,
+        )
+
+    async def _new_session():
+        session = await app_ctx.sessions.create(
+            agent=c.default_agent,
+            provider_id=c.default_provider,
+            model_id=c.default_model,
+        )
+        app_ctx._current_session_id = session.id
+        console.print(f"[dim]新会话: {session.id}[/dim]")
+
+    app_ctx.queue = PromptQueue(
+        run_fn=_run_prompt,
+        on_new_session=_new_session,
+        on_status=lambda s: setattr(app_ctx.status_bar, 'phase', s),
+    )
+
     while True:
         try:
             abort.clear()
+            app_ctx.status_bar.reset_interrupt()
 
-            # 状态栏
-            reg = app_ctx.registry
-            m = reg.resolve(_model)
-            status_line = (
-                f"[dim]{_provider}[/dim] "
-                f"[bold]{_model}[/bold]"
-            )
-            if m:
-                status_line += (
-                    f"  name=[bold]{m.name}[/bold]"
-                    f"  cost={m.cost}  cap={m.capability}"
-                )
-            status_line += f"  key={_key_status(c, _provider, reg)}"
-            bu = _get_base_url(c, _provider, reg)
-            if bu:
-                status_line += f"  base=[dim]{bu}[/dim]"
-            console.print(f"  {status_line}")
-
+            # 构建提示文本
             if app_ctx._current_session_id:
-                prompt_text = f"[dim]… [{app_ctx._current_session_id[:16]}][/dim] > "
+                session_short = app_ctx._current_session_id[:8]
+                prompt_text = f"[dim][{session_short}][/dim] [bold green]> [/bold green]"
             else:
                 prompt_text = "[bold green]> [/bold green]"
-            user_input = console.input(prompt_text)
+
+            # 显示状态栏
+            status_line = app_ctx.status_bar.render(compact=True)
+            if status_line:
+                console.print(f"[dim]{status_line}[/dim]")
+
+            # 获取用户输入（支持历史导航）
+            try:
+                from prompt_toolkit import PromptSession
+                from prompt_toolkit.history import InMemoryHistory
+
+                # 使用 prompt_toolkit 获取输入（支持历史导航）
+                session = PromptSession(history=InMemoryHistory())
+                user_input = await session.prompt_async(prompt_text)
+            except ImportError:
+                # 降级到简单输入
+                user_input = console.input(prompt_text)
+
         except (EOFError, KeyboardInterrupt):
             console.print("\n[dim]再见[/dim]")
             break
@@ -412,6 +470,9 @@ async def _repl_async(
         user_input = user_input.strip()
         if not user_input:
             continue
+
+        # 添加到历史记录
+        app_ctx.history.push(user_input)
 
         if user_input.startswith("/"):
             handled = await _handle_command(
@@ -425,11 +486,9 @@ async def _repl_async(
                 _provider = c.default_provider
             continue
 
-        await _send_prompt(
-            app_ctx, user_input,
-            agent_name=_agent, model_id=_model, provider_id=_provider,
-            steps=steps, abort=abort,
-        )
+        # 提交到队列
+        prompt_input = PromptParser.parse(user_input, c.workspace_root)
+        app_ctx.queue.submit(prompt_input)
 
     await app_ctx.db.close()
 
@@ -762,6 +821,11 @@ def _print_help():
             "[bold]/mcp add <n> <cmd> [a][/bold] 添加项目 MCP\n"
             "[bold]/mcp add --global <n> <cmd> [a][/bold] 添加全局 MCP\n"
             "[bold]/mcp remove <name>[/bold]   删除 MCP\n\n"
+            "[bold]交互功能[/bold]\n"
+            "[bold]↑↓[/bold]                  浏览历史记录\n"
+            "[bold]@filename[/bold]           引用文件\n"
+            "[bold]@agent[/bold]              切换 Agent\n"
+            "[bold]Ctrl+C[/bold]              中断当前执行\n\n"
             "直接输入内容则发送给 Agent",
             title="帮助",
             border_style="blue",
