@@ -60,6 +60,12 @@ from src.tool.write import WriteTool
 
 from typing import Any
 
+from src.channels.manager import ChannelManager
+from src.channels.config import ChannelConfigManager
+from src.channels.qqbot import QQBotPlugin
+from src.channels.base import ChannelConfig
+from src.channels.logger import init_logger, get_logger
+
 app = typer.Typer(
     name="sunshine",
     help="SunshineAgent — AI coding agent",
@@ -87,6 +93,10 @@ class AppContext:
         self._current_session_id: str | None = None
         self._loop_factory = None
         self._mcp_configs: list[MCPServerConfig] = []
+        
+        # Channel management
+        self.channel_manager: ChannelManager = ChannelManager()
+        self.channel_config_manager: ChannelConfigManager | None = None
 
     @property
     def current_session_id(self) -> str | None:
@@ -144,6 +154,19 @@ async def _init(ctx: AppContext, workspace: Path):
     for mcfg in global_mcp:
         if mcfg.source == "global" and mcfg.name not in {c.name for c in ctx._mcp_configs}:
             ctx._mcp_configs.append(mcfg)
+    
+    # Initialize channel manager
+    config_dir = str(workspace / ".sunshine" / "channels")
+    ctx.channel_config_manager = ChannelConfigManager(config_dir)
+    
+    # Initialize logger
+    log_dir = str(workspace / ".sunshine" / "logs")
+    init_logger(log_dir=log_dir, log_to_file=True, log_to_console=False)
+    
+    # Set app context for channel manager
+    ctx.channel_manager.set_app_context(ctx)
+    
+    _register_channels(ctx)
 
 
 def _register_tools(ctx: AppContext, workspace: Path, skill_loader=None):
@@ -178,6 +201,35 @@ def _register_tools(ctx: AppContext, workspace: Path, skill_loader=None):
     ctx._loop_factory = _lf
     router = ModelRouter()
     t.register(TaskTool(ctx.sessions, ctx.agents, _lf, ctx.jobs, router, ctx.registry))
+
+
+def _register_channels(ctx: AppContext):
+    """Register channel plugins."""
+    if not ctx.channel_config_manager:
+        return
+    
+    # Load all channel configurations
+    configs = ctx.channel_config_manager.load_all_configs()
+    
+    # Register QQ Bot plugin if configured
+    if "qqbot" in configs:
+        config = configs["qqbot"]
+        plugin = QQBotPlugin(config)
+        ctx.channel_manager.register_plugin(plugin)
+        console.print(f"[dim]Channel: QQ Bot ({'enabled' if config.enabled else 'disabled'})[/dim]")
+    else:
+        # Create default QQ Bot configuration
+        default_config = ChannelConfig(
+            channel_id="qqbot",
+            enabled=False,
+            config={
+                "app_id": "",
+                "app_secret": "",
+                "sandbox": False,
+            },
+        )
+        ctx.channel_config_manager.save_config(default_config)
+        console.print("[dim]Channel: QQ Bot (not configured)[/dim]")
 
 
 async def _ask_user_cli(questions: list[dict[str, Any]]) -> dict[str, Any]:
@@ -675,6 +727,27 @@ async def _handle_command(
             _mcp_list(ctx)
         return None
 
+    if action == "/channel":
+        if not args or args == "list":
+            _channel_list(ctx)
+            return None
+        parts2 = args.split(maxsplit=1)
+        sub = parts2[0].lower()
+        rest = parts2[1] if len(parts2) > 1 else ""
+        if sub == "enable":
+            _channel_enable(ctx, rest)
+        elif sub == "disable":
+            _channel_disable(ctx, rest)
+        elif sub == "config":
+            _channel_config(ctx, rest)
+        elif sub == "connect":
+            await _channel_connect(ctx, rest)
+        elif sub == "disconnect":
+            await _channel_disconnect(ctx, rest)
+        else:
+            _channel_list(ctx)
+        return None
+
     console.print(f"[red]未知命令: {action}[/red] 输入 /help 查看帮助")
     return None
 
@@ -768,6 +841,159 @@ async def _mcp_remove(ctx: AppContext, name: str):
     console.print(f"[green]✓ MCP server {name} 已删除[/green]")
 
 
+# ── Channel 管理 ─────────────────────────────────────────────────────
+
+
+def _channel_list(ctx: AppContext):
+    """列出所有 channel 插件。"""
+    if not ctx.channel_config_manager:
+        console.print("[dim]Channel 管理器未初始化[/dim]")
+        return
+    
+    configs = ctx.channel_config_manager.get_all_configs()
+    if not configs:
+        console.print("[dim]没有配置任何 channel[/dim]")
+        console.print("使用 [bold]/channel config <channel_id>[/bold] 配置 channel")
+        return
+    
+    table = Table(title="Channel 插件")
+    table.add_column("状态")
+    table.add_column("ID")
+    table.add_column("名称")
+    table.add_column("描述")
+    
+    for channel_id, config in configs.items():
+        plugin = ctx.channel_manager.get_plugin(channel_id)
+        status = "[green]✓ 启用[/green]" if config.enabled else "[dim]○ 禁用[/dim]"
+        name = plugin.channel_name if plugin else channel_id
+        desc = plugin.channel_description if plugin else "-"
+        table.add_row(status, channel_id, name, desc)
+    
+    console.print(table)
+    console.print("[dim]/channel enable <id> 启用  /channel disable <id> 禁用[/dim]")
+    console.print("[dim]/channel config <id> 配置  /channel connect <id> 连接[/dim]")
+
+
+def _channel_enable(ctx: AppContext, channel_id: str):
+    """启用 channel。"""
+    if not channel_id:
+        console.print("[red]用法: /channel enable <channel_id>[/red]")
+        return
+    
+    if not ctx.channel_config_manager:
+        console.print("[red]Channel 管理器未初始化[/red]")
+        return
+    
+    config = ctx.channel_config_manager.get_config(channel_id)
+    if not config:
+        console.print(f"[red]Channel {channel_id} 未找到[/red]")
+        return
+    
+    config.enabled = True
+    ctx.channel_config_manager.save_config(config)
+    console.print(f"[green]✓ Channel {channel_id} 已启用[/green]")
+
+
+def _channel_disable(ctx: AppContext, channel_id: str):
+    """禁用 channel。"""
+    if not channel_id:
+        console.print("[red]用法: /channel disable <channel_id>[/red]")
+        return
+    
+    if not ctx.channel_config_manager:
+        console.print("[red]Channel 管理器未初始化[/red]")
+        return
+    
+    config = ctx.channel_config_manager.get_config(channel_id)
+    if not config:
+        console.print(f"[red]Channel {channel_id} 未找到[/red]")
+        return
+    
+    config.enabled = False
+    ctx.channel_config_manager.save_config(config)
+    console.print(f"[green]✓ Channel {channel_id} 已禁用[/green]")
+
+
+def _channel_config(ctx: AppContext, channel_id: str):
+    """配置 channel。"""
+    if not channel_id:
+        console.print("[red]用法: /channel config <channel_id>[/red]")
+        return
+    
+    if not ctx.channel_config_manager:
+        console.print("[red]Channel 管理器未初始化[/red]")
+        return
+    
+    config = ctx.channel_config_manager.get_config(channel_id)
+    if not config:
+        console.print(f"[red]Channel {channel_id} 未找到[/red]")
+        return
+    
+    # Show current configuration
+    console.print(f"[bold]Channel: {channel_id}[/bold]")
+    console.print(f"  启用: {'是' if config.enabled else '否'}")
+    console.print(f"  配置: {config.config}")
+    console.print(f"  允许的用户: {config.allowed_users or '所有'}")
+    console.print(f"  允许的群组: {config.allowed_groups or '所有'}")
+    console.print(f"  群组需要@: {'是' if config.require_mention else '否'}")
+    console.print(f"  最大消息长度: {config.max_message_length}")
+    console.print(f"  速率限制: {config.rate_limit} 消息/分钟")
+    
+    # Show channel-specific configuration
+    if channel_id == "qqbot":
+        console.print("\n[bold]QQ Bot 配置:[/bold]")
+        console.print(f"  App ID: {config.config.get('app_id', '未设置')}")
+        console.print(f"  App Secret: {'已设置' if config.config.get('app_secret') else '未设置'}")
+        console.print(f"  沙盒模式: {'是' if config.config.get('sandbox') else '否'}")
+        console.print("\n[dim]使用以下命令配置:")
+        console.print("  /channel config qqbot app_id <your_app_id>")
+        console.print("  /channel config qqbot app_secret <your_app_secret>")
+        console.print("  /channel config qqbot sandbox true|false[/dim]")
+
+
+async def _channel_connect(ctx: AppContext, channel_id: str):
+    """连接 channel。"""
+    if not channel_id:
+        console.print("[red]用法: /channel connect <channel_id>[/red]")
+        return
+    
+    plugin = ctx.channel_manager.get_plugin(channel_id)
+    if not plugin:
+        console.print(f"[red]Channel {channel_id} 未找到[/red]")
+        return
+    
+    if plugin.is_connected:
+        console.print(f"[yellow]Channel {channel_id} 已经连接[/yellow]")
+        return
+    
+    console.print(f"[dim]正在连接 {channel_id}...[/dim]")
+    success = await plugin.connect()
+    
+    if success:
+        console.print(f"[green]✓ Channel {channel_id} 已连接[/green]")
+    else:
+        console.print(f"[red]Channel {channel_id} 连接失败[/red]")
+
+
+async def _channel_disconnect(ctx: AppContext, channel_id: str):
+    """断开 channel 连接。"""
+    if not channel_id:
+        console.print("[red]用法: /channel disconnect <channel_id>[/red]")
+        return
+    
+    plugin = ctx.channel_manager.get_plugin(channel_id)
+    if not plugin:
+        console.print(f"[red]Channel {channel_id} 未找到[/red]")
+        return
+    
+    if not plugin.is_connected:
+        console.print(f"[yellow]Channel {channel_id} 未连接[/yellow]")
+        return
+    
+    await plugin.disconnect()
+    console.print(f"[green]✓ Channel {channel_id} 已断开连接[/green]")
+
+
 def _model_list(ctx):
     """列出所有可用模型，按 provider 分组。"""
     reg = ctx.registry
@@ -824,6 +1050,12 @@ def _print_help():
             "[bold]/mcp add <n> <cmd> [a][/bold] 添加项目 MCP\n"
             "[bold]/mcp add --global <n> <cmd> [a][/bold] 添加全局 MCP\n"
             "[bold]/mcp remove <name>[/bold]   删除 MCP\n\n"
+            "[bold]/channel[/bold]             列出所有 channel 插件\n"
+            "[bold]/channel enable <id>[/bold] 启用 channel\n"
+            "[bold]/channel disable <id>[/bold] 禁用 channel\n"
+            "[bold]/channel config <id>[/bold] 配置 channel\n"
+            "[bold]/channel connect <id>[/bold] 连接 channel\n"
+            "[bold]/channel disconnect <id>[/bold] 断开 channel\n\n"
             "直接输入内容则发送给 Agent",
             title="帮助",
             border_style="blue",
