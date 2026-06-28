@@ -58,6 +58,8 @@ from src.tool.webfetch import WebFetchTool
 from src.tool.websearch import WebSearchTool
 from src.tool.write import WriteTool
 
+from typing import Any
+
 app = typer.Typer(
     name="sunshine",
     help="SunshineAgent — AI coding agent",
@@ -178,6 +180,62 @@ def _register_tools(ctx: AppContext, workspace: Path, skill_loader=None):
     t.register(TaskTool(ctx.sessions, ctx.agents, _lf, ctx.jobs, router, ctx.registry))
 
 
+async def _ask_user_cli(questions: list[dict[str, Any]]) -> dict[str, Any]:
+    """在 CLI 中向用户展示问题并收集答案。"""
+    results: dict[str, Any] = {}
+    
+    for q in questions:
+        header = q.get("header", "Question")
+        question_text = q.get("question", "")
+        options = q.get("options", [])
+        multiple = q.get("multiple", False)
+        
+        console.print(f"\n[bold cyan]{header}[/bold cyan]")
+        console.print(question_text)
+        
+        if options:
+            # 有选项的情况
+            for i, opt in enumerate(options, 1):
+                label = opt.get("label", f"Option {i}")
+                description = opt.get("description", "")
+                console.print(f"  {i}. [bold]{label}[/bold] - {description}")
+            
+            if multiple:
+                # 多选
+                console.print("[dim]输入选项编号（用逗号分隔），如: 1,3[/dim]")
+                while True:
+                    choice = console.input("[bold green]> [/bold green]")
+                    try:
+                        indices = [int(x.strip()) - 1 for x in choice.split(",")]
+                        if all(0 <= i < len(options) for i in indices):
+                            selected = [options[i]["label"] for i in indices]
+                            results[header] = selected
+                            break
+                        else:
+                            console.print("[red]无效选项，请重新输入[/red]")
+                    except ValueError:
+                        console.print("[red]请输入有效的数字[/red]")
+            else:
+                # 单选
+                while True:
+                    choice = console.input("[bold green]> [/bold green]")
+                    try:
+                        index = int(choice.strip()) - 1
+                        if 0 <= index < len(options):
+                            results[header] = options[index]["label"]
+                            break
+                        else:
+                            console.print("[red]无效选项，请重新输入[/red]")
+                    except ValueError:
+                        console.print("[red]请输入有效的数字[/red]")
+        else:
+            # 没有选项，自由输入
+            answer = console.input("[bold green]> [/bold green]")
+            results[header] = answer
+    
+    return results
+
+
 async def _send_prompt(
     ctx: AppContext,
     prompt: str,
@@ -188,6 +246,7 @@ async def _send_prompt(
     steps: int | None = None,
     quiet: bool = False,
     abort: asyncio.Event | None = None,
+    ask_callback: Any = None,
 ) -> str | None:
     c = ctx.config
     reg = ctx.registry
@@ -227,6 +286,7 @@ async def _send_prompt(
         workspace=c.workspace_root,
         on_text_delta=_on_text,
         abort_signal=abort_sig,
+        ask_callback=ask_callback,
     )
 
     if not quiet:
@@ -290,6 +350,7 @@ def run(
         await _send_prompt(
             ctx, prompt, agent_name=agent, model_id=model,
             provider_id=provider, steps=steps, quiet=quiet,
+            ask_callback=_ask_user_cli,
         )
         await ctx.db.close()
 
@@ -429,6 +490,7 @@ async def _repl_async(
             app_ctx, user_input,
             agent_name=_agent, model_id=_model, provider_id=_provider,
             steps=steps, abort=abort,
+            ask_callback=_ask_user_cli,
         )
 
     await app_ctx.db.close()

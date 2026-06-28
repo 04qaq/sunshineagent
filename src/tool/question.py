@@ -5,7 +5,20 @@ from src.tool.base import Tool, ToolContext, ToolResult
 
 class QuestionTool(Tool):
     name = "question"
-    description = "Ask the user a question during execution."
+    description = """Ask the user a question during execution. Use this tool when you need to gather information from the user before proceeding. This is the preferred way to ask questions - do NOT just print questions in your response.
+
+When to use:
+- When you need clarification on requirements
+- When you need the user to make a choice between options
+- When you need more details before starting work
+- When the user asks you to ask them questions
+
+Do NOT use for:
+- Rhetorical questions
+- Questions you can answer yourself
+- Simple acknowledgments
+
+The tool presents questions with optional multiple-choice options and collects user answers."""
     parameters = {
         "type": "object",
         "properties": {

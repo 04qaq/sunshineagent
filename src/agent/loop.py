@@ -38,6 +38,7 @@ class SessionContext:
     workspace: str = ""
     on_text_delta: object | None = None  # callback(text: str) 流式输出
     abort_signal: object | None = None  # asyncio.Event 中断信号
+    ask_callback: object | None = None  # callback(questions: list) -> dict 向用户提问
 
 
 @dataclass
@@ -295,6 +296,7 @@ class AgentLoop:
                         agent=ctx.agent_name,
                         assistant_message_id=None,
                         tool_call_id=call_id,
+                        ask_callback=ctx.ask_callback,
                     )
                     output = await tool.execute(args, tool_ctx)
                     truncated = self._truncate_output(output, max_tokens=10000)
