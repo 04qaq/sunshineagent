@@ -25,7 +25,13 @@ htmlcov/
 
 node_modules/
 
-# 参考源码，不纳入版本控制
+# 排除测试目录
+tests/
+
+# 排除文档目录
+docs/
+
+# 参考源码
 docs/参考源码/
 
 # 本地配置和数据
@@ -35,3 +41,11 @@ docs/参考源码/
 Thumbs.db
 
 *.log
+
+# 配置文件
+pyproject.toml
+uv.lock
+.claude/
+.codegraph/
+.vscode/
+.idea/
