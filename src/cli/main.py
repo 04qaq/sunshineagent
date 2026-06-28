@@ -27,6 +27,7 @@ from src.cli.permission_ui import PermissionUI, QuestionUI
 from src.cli.prompt import PromptHistory, PromptInput, PromptParser
 from src.cli.queue import PromptQueue
 from src.cli.status_bar import StatusBar
+from src.cli.tui.runner import TuiRunner
 from src.config.config import get_config, load_config, save_config
 from src.mcp import (
     MCPClient,
@@ -334,6 +335,72 @@ def serve(
 ):
     """启动 HTTP API 服务（Phase 4）"""
     console.print(f"[yellow]serve 命令将在 Phase 4 实现[/yellow] (http://{host}:{port})")
+
+
+# ── tui 命令 ─────────────────────────────────────────────────────────
+
+
+@app.command()
+def tui(
+    agent: str = typer.Option("build", help="使用的 Agent 名称"),
+    model: str = typer.Option("claude-sonnet-4-6", help="模型 ID"),
+    provider: str = typer.Option("anthropic", help="Provider ID (anthropic / openai)"),
+    base_url: str = typer.Option(None, help="API base URL"),
+    workspace: Path = typer.Option(  # noqa: B008
+        Path.cwd(), help="工作区目录", exists=True, file_okay=False  # noqa: B008
+    ),
+):
+    """启动 TUI 模式（分屏界面）"""
+
+    async def _go():
+        app_ctx = AppContext()
+        await _init(app_ctx, workspace)
+        load_config(app_ctx.config)
+
+        if base_url:
+            p = app_ctx.registry.get_provider(provider)
+            if p:
+                p.base_url = base_url
+            else:
+                app_ctx.registry.add_provider(provider, provider.title(), base_url=base_url)
+
+        reg = app_ctx.registry
+        _agent = agent or app_ctx.config.default_agent
+        _model = model or reg.default_model
+        _provider = provider or reg.default_provider
+
+        # 解析模型
+        raw_model = _model
+        if "/" in raw_model:
+            _provider = raw_model.split("/")[0]
+            raw_model = raw_model.split("/", 1)[1]
+
+        # 创建 TUI 运行器
+        async def on_prompt(text: str):
+            await _send_prompt(
+                app_ctx, text,
+                agent_name=_agent, model_id=_model, provider_id=_provider,
+            )
+
+        def on_interrupt():
+            # TODO: 实现中断逻辑
+            pass
+
+        runner = TuiRunner(
+            on_prompt=on_prompt,
+            on_interrupt=on_interrupt,
+            agent_name=_agent,
+            model_name=raw_model,
+        )
+
+        # 更新状态栏
+        runner.update_agent(_agent)
+        runner.update_model(raw_model, _provider)
+
+        await runner.run()
+        await app_ctx.db.close()
+
+    asyncio.run(_go())
 
 
 # ── 默认命令：交互 REPL ──────────────────────────────────────────────
