@@ -40,7 +40,7 @@ class EditTool(Tool):
         new_str = params["newString"]
         replace_all = params.get("replaceAll", False)
 
-        if file_path != params["filePath"] and not file_path.is_relative_to(self._workspace):
+        if not file_path.is_relative_to(self._workspace):
             return ToolResult(output="Access denied: path outside workspace")
 
         if new_str == old_str:

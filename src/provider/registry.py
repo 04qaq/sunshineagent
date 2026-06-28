@@ -32,6 +32,7 @@ class ModelInfo:
 class Provider:
     """Provider 配置。"""
     name: str
+    protocol: str = "openai-compatible"  # "anthropic" | "openai-compatible"
     api_key: str = ""
     base_url: str = ""
     env_key: str = ""        # 环境变量名，如 "OPENAI_API_KEY"
@@ -51,6 +52,7 @@ class Provider:
 DEFAULT_PROVIDERS: dict[str, Provider] = {
     "anthropic": Provider(
         name="Anthropic",
+        protocol="anthropic",
         env_key="ANTHROPIC_API_KEY",
         models={
             "claude-opus-4-6": ModelInfo(
@@ -135,6 +137,102 @@ class ProviderRegistry:
         self._workspace = workspace
         self._load_config()
         self._load_project()
+        self._autodetect()
+
+    # ── 环境变量读取 ────────────────────────────────────────────────────
+
+    def _read_dotenv(self) -> dict[str, str]:
+        """解析 .env 文件，返回 key-value 字典。
+        仅当 key 在 os.environ 中不存在时才使用 .env 的值（系统 env var 优先）。
+        查找: workspace/.env, ~/.env
+        """
+        result: dict[str, str] = {}
+        paths = []
+        if self._workspace:
+            paths.append(Path(self._workspace) / ".env")
+        paths.append(Path.home() / ".env")
+        for path in paths:
+            if not path.exists():
+                continue
+            try:
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" not in line:
+                        continue
+                    k, _, v = line.partition("=")
+                    k = k.strip()
+                    v = v.strip().strip('"').strip("'")
+                    if k and k not in os.environ:
+                        result[k] = v
+            except Exception:
+                pass
+        return result
+
+    def _read_env(self, key: str) -> str:
+        """读取环境变量：先查 os.environ，再查 .env 文件。"""
+        if not key:
+            return ""
+        val = os.environ.get(key)
+        if val:
+            return val
+        dotenv = self._read_dotenv()
+        return dotenv.get(key, "")
+
+    # ── 自动检测 ────────────────────────────────────────────────────────
+
+    def _autodetect(self):
+        """遍历 provider，自动从环境变量发现 API key。
+        如果已有 config 中设置的 key 则保留不变。
+        """
+        for pid, p in self._providers.items():
+            if not p.api_key and p.env_key:
+                key = self._read_env(p.env_key)
+                if key:
+                    p.api_key = key
+
+    @property
+    def has_any_key(self) -> bool:
+        for p in self._providers.values():
+            if p.api_key:
+                return True
+        return False
+
+    @property
+    def detected_providers(self) -> list[str]:
+        return [pid for pid, p in self._providers.items() if p.api_key]
+
+    # ── 动态添加 Provider/Model ─────────────────────────────────────────
+
+    def add_provider(self, pid: str, name: str, protocol: str = "openai-compatible",
+                     api_key: str = "", base_url: str = "") -> Provider:
+        """添加或更新一个 provider。"""
+        if pid in self._providers:
+            p = self._providers[pid]
+            p.name = name
+            p.protocol = protocol
+            if api_key:
+                p.api_key = api_key
+            if base_url:
+                p.base_url = base_url
+        else:
+            p = Provider(name=name, protocol=protocol, api_key=api_key, base_url=base_url)
+            self._providers[pid] = p
+        return p
+
+    def add_model(self, pid: str, mid: str, name: str,
+                  cost: str = "medium", capability: str = "medium",
+                  context: int = 128000, output: int = 16384) -> ModelInfo | None:
+        """向 provider 添加一个模型。provider 不存在则返回 None。"""
+        p = self._providers.get(pid)
+        if not p:
+            return None
+        m = ModelInfo(provider=pid, model=mid, name=name,
+                      cost=cost, capability=capability,
+                      context=context, output=output)
+        p.models[mid] = m
+        return m
 
     # ── 加载 ────────────────────────────────────────────────────────────
 
@@ -142,9 +240,10 @@ class ProviderRegistry:
         for pid, p in DEFAULT_PROVIDERS.items():
             self._providers[pid] = Provider(
                 name=p.name,
+                protocol=p.protocol,
                 base_url=p.base_url,
                 env_key=p.env_key,
-                api_key=os.environ.get(p.env_key, ""),
+                api_key=self._read_env(p.env_key),
                 models={mid: ModelInfo(**vars(m)) for mid, m in p.models.items()},
             )
 
@@ -174,20 +273,26 @@ class ProviderRegistry:
         # 新版 providers 格式
         for prov_id, prov_data in data.get("providers", {}).items():
             if prov_id not in self._providers:
-                self._providers[prov_id] = Provider(name=prov_data.get("name", prov_id))
+                self._providers[prov_id] = Provider(
+                    name=prov_data.get("name", prov_id),
+                    protocol=prov_data.get("protocol", "openai-compatible"),
+                )
             p = self._providers[prov_id]
             if "base_url" in prov_data:
                 p.base_url = prov_data["base_url"]
             if "api_key" in prov_data:
                 p.api_key = prov_data["api_key"]
+            if "protocol" in prov_data:
+                p.protocol = prov_data["protocol"]
             for mid, mdata in prov_data.get("models", {}).items():
+                existing = p.models.get(mid)
                 p.models[mid] = ModelInfo(
                     provider=prov_id, model=mid,
-                    name=mdata.get("name", mid),
-                    cost=mdata.get("cost", "medium"),
-                    capability=mdata.get("capability", "medium"),
-                    context=mdata.get("context", 128000),
-                    output=mdata.get("output", 16384),
+                    name=mdata.get("name", existing.name if existing else mid),
+                    cost=mdata.get("cost", existing.cost if existing else "medium"),
+                    capability=mdata.get("capability", existing.capability if existing else "medium"),
+                    context=mdata.get("context", existing.context if existing else 128000),
+                    output=mdata.get("output", existing.output if existing else 16384),
                 )
 
         # 旧版扁平格式兼容
@@ -273,6 +378,7 @@ class ProviderRegistry:
         }
         for pid, p in self._providers.items():
             data["providers"][pid] = {
+                "protocol": p.protocol,
                 "base_url": p.base_url,
                 "api_key": p.api_key,
             }

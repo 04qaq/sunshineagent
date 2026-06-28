@@ -2,6 +2,7 @@
 
 import json
 
+from src.provider.base import ContentBlock, UnifiedMessage
 from src.tool.base import Tool, ToolContext, ToolRegistry, ToolResult
 
 
@@ -77,8 +78,7 @@ class TestBashTool:
 
 
 class TestMessageConversion:
-    def test_openai_message_order(self):
-        """确保 assistant 消息在 tool_result 之前。"""
+    def test_unified_message_order(self):
         from src.agent.loop import AgentLoop
 
         class MockMsg:
@@ -100,15 +100,79 @@ class TestMessageConversion:
             ),
         ]
 
-        result = AgentLoop._to_openai_messages(messages)
+        result = AgentLoop._to_unified_messages(messages)
+        assert len(result) == 2
+        assert result[0].role == "user"
+        assert result[0].content[0].type == "text"
+        assert result[0].content[0].text == "hello"
+        assert result[1].role == "assistant"
+        assert result[1].content[0].type == "text"
+        assert result[1].content[1].type == "tool_call"
+        assert result[1].content[2].type == "tool_result"
+
+    def test_openai_convert_messages(self):
+        from src.provider.openai_client import OpenAIClient
+
+        messages = [
+            UnifiedMessage(
+                role="user",
+                content=[ContentBlock(type="text", text="hello")],
+            ),
+            UnifiedMessage(
+                role="assistant",
+                content=[
+                    ContentBlock(type="text", text="let me read"),
+                    ContentBlock(
+                        type="tool_call", tool_call_id="t1",
+                        tool_name="read", tool_args={"filePath": "/x"},
+                    ),
+                    ContentBlock(
+                        type="tool_result", tool_call_id="t1",
+                        tool_output="contents",
+                    ),
+                ],
+            ),
+        ]
+
+        client = OpenAIClient(api_key="dummy")
+        result = client._convert_messages(messages)
         roles = [m["role"] for m in result]
-        # 顺序应为: user, assistant, tool
         assert roles == ["user", "assistant", "tool"], f"unexpected order: {roles}"
-        # tool 消息必须有 tool_call_id
         assert result[2]["tool_call_id"] == "t1"
-        # assistant 消息必须有 tool_calls
         assert "tool_calls" in result[1]
         assert result[1]["tool_calls"][0]["id"] == "t1"
+
+    def test_anthropic_convert_messages(self):
+        from src.provider.anthropic_client import AnthropicClient
+
+        messages = [
+            UnifiedMessage(
+                role="user",
+                content=[ContentBlock(type="text", text="hello")],
+            ),
+            UnifiedMessage(
+                role="assistant",
+                content=[
+                    ContentBlock(
+                        type="tool_call", tool_call_id="t1",
+                        tool_name="read", tool_args={"filePath": "/x"},
+                    ),
+                    ContentBlock(
+                        type="tool_result", tool_call_id="t1",
+                        tool_output="contents",
+                    ),
+                ],
+            ),
+        ]
+
+        client = AnthropicClient()
+        result = client._convert_messages(messages)
+        assert len(result) == 2
+        assert result[0]["role"] == "user"
+        assert result[0]["content"][0]["type"] == "text"
+        assert result[1]["role"] == "assistant"
+        assert result[1]["content"][0]["type"] == "tool_use"
+        assert result[1]["content"][1]["type"] == "tool_result"
     async def test_grep_match(self, tmp_path):
         from src.tool.grep import GrepTool
 

@@ -52,32 +52,36 @@ def _config_path() -> Path:
 
 
 def save_config(settings: Settings):
-    """持久化当前配置到 ~/.sunshine/config.json。"""
+    """持久化当前配置到 ~/.sunshine/config.json。保留已有数据，只更新 Settings 管理的字段。"""
     path = _config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    data = {
-        "default_agent": settings.default_agent,
-        "default_provider": settings.default_provider,
-        "default_model": settings.default_model,
-        # 旧版兼容（扁平 key）
-        "openai_api_key": settings.openai_api_key,
-        "openai_base_url": settings.openai_base_url,
-        "anthropic_api_key": settings.anthropic_api_key,
-        "anthropic_base_url": settings.anthropic_base_url,
-        # 新版 providers 格式
-        "providers": {},
-    }
+    # 读取已有数据，保留 registry 写入的 providers 等字段
+    existing: dict = {}
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    existing["default_agent"] = settings.default_agent
+    existing["default_provider"] = settings.default_provider
+    existing["default_model"] = settings.default_model
+    # 旧版兼容（扁平 key）
+    existing["openai_api_key"] = settings.openai_api_key
+    existing["openai_base_url"] = settings.openai_base_url
+    existing["anthropic_api_key"] = settings.anthropic_api_key
+    existing["anthropic_base_url"] = settings.anthropic_base_url
+    # 确保 providers 键存在，合并 openai/anthropic 的 key/url
+    if "providers" not in existing:
+        existing["providers"] = {}
     if settings.openai_api_key or settings.openai_base_url:
-        data["providers"]["openai"] = {
-            "base_url": settings.openai_base_url or "",
-            "api_key": settings.openai_api_key or "",
-        }
+        existing["providers"].setdefault("openai", {})
+        existing["providers"]["openai"]["base_url"] = settings.openai_base_url or ""
+        existing["providers"]["openai"]["api_key"] = settings.openai_api_key or ""
     if settings.anthropic_api_key or settings.anthropic_base_url:
-        data["providers"]["anthropic"] = {
-            "base_url": settings.anthropic_base_url or "",
-            "api_key": settings.anthropic_api_key or "",
-        }
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        existing["providers"].setdefault("anthropic", {})
+        existing["providers"]["anthropic"]["base_url"] = settings.anthropic_base_url or ""
+        existing["providers"]["anthropic"]["api_key"] = settings.anthropic_api_key or ""
+    path.write_text(json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def load_config(settings: Settings):

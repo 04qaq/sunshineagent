@@ -39,7 +39,10 @@ class ApplyPatchTool(Tool):
                 if current_hunk:
                     hunks.append(current_hunk)
                     current_hunk = []
-                current_file = line[4:].strip()
+                path = line[4:].strip()
+                if path.startswith("a/") or path.startswith("b/"):
+                    path = path[2:]
+                current_file = path
                 continue
             if current_file:
                 current_hunk.append(line)

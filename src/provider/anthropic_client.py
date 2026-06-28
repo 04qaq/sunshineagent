@@ -1,11 +1,15 @@
-"""Anthropic LLM client adapter."""
+"""Anthropic LLM client adapter.
+
+Handles conversion from UnifiedMessage to Anthropic Messages API format
+and provider-specific post-processing (类似 OpenCode 的 ProviderTransform).
+"""
 
 import json
 from collections.abc import AsyncIterator
 
 from anthropic import AsyncAnthropic
 
-from src.provider.base import ProviderClient, StreamEvent
+from src.provider.base import ContentBlock, ProviderClient, StreamEvent, UnifiedMessage
 
 
 class AnthropicClient(ProviderClient):
@@ -17,20 +21,85 @@ class AnthropicClient(ProviderClient):
             base_url=base_url or None,
         )
 
+    def _convert_messages(self, messages: list[UnifiedMessage]) -> list[dict]:
+        """Convert UnifiedMessage list to Anthropic Messages API format.
+
+        Anthropic uses content blocks: tool_use / tool_result / text all live
+        inside the same message's content array.
+        """
+        result: list[dict] = []
+        for msg in messages:
+            content: list[dict] = []
+            for block in msg.content:
+                if block.type == "text":
+                    content.append({"type": "text", "text": block.text})
+                elif block.type == "tool_call":
+                    content.append(
+                        {
+                            "type": "tool_use",
+                            "id": block.tool_call_id,
+                            "name": block.tool_name,
+                            "input": block.tool_args or {},
+                        }
+                    )
+                elif block.type == "tool_result":
+                    content.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": block.tool_call_id,
+                            "content": block.tool_output,
+                            "is_error": block.is_error,
+                        }
+                    )
+            result.append({"role": msg.role, "content": content})
+        return self._postprocess(result)
+
+    def _postprocess(self, messages: list[dict]) -> list[dict]:
+        """Anthropic-specific post-processing.
+
+        - Filter out empty text blocks (Anthropic rejects them).
+        - Ensure tool_use IDs only contain [a-zA-Z0-9_-].
+        """
+        import re
+
+        for msg in messages:
+            content = msg.get("content", [])
+            if not isinstance(content, list):
+                continue
+
+            filtered: list[dict] = []
+            for block in content:
+                if block.get("type") == "text" and not block.get("text", "").strip():
+                    continue
+                if block.get("type") == "tool_use":
+                    block["id"] = re.sub(
+                        r"[^a-zA-Z0-9_-]", "", block.get("id", "")
+                    )
+                filtered.append(block)
+
+            if not filtered:
+                msg["content"] = [{"type": "text", "text": "."}]
+            else:
+                msg["content"] = filtered
+
+        return messages
+
     async def stream(
         self,
         model: str,
         system: str,
-        messages: list[dict],
+        messages: list[UnifiedMessage],
         tools: list[dict],
         temperature: float = 0.7,
         top_p: float | None = None,
         max_tokens: int | None = None,
     ) -> AsyncIterator[StreamEvent]:
+        api_messages = self._convert_messages(messages)
+
         async with self._client.messages.stream(
             model=model,
             system=system,
-            messages=messages,
+            messages=api_messages,
             tools=tools if tools else None,
             max_tokens=max_tokens or 16384,
             temperature=temperature,
@@ -59,7 +128,6 @@ class AnthropicClient(ProviderClient):
                         finish_reason="stop",
                         usage=usage,
                     )
-            # 安全网：stream 结束时未收到 message_stop
             if not stopped:
                 yield StreamEvent(
                     type="finish",

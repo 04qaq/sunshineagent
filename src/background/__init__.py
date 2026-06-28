@@ -38,6 +38,8 @@ class BackgroundJobManager:
         self._jobs[job.id] = job
 
         def done_callback(t: asyncio.Task):
+            if job.status in (JobStatus.CANCELLED,):
+                return
             if t.exception():
                 job.status = JobStatus.FAILED
                 job.error = str(t.exception())

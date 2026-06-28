@@ -4,7 +4,7 @@ OWNER: Human
 SKILL: Jinja2 templates, message format conversion
 
 Pipeline:
-  base template → instructions(AGENTS.md) → agent_prompt → environment → 拼接
+  base template → instructions(AGENTS.md) → agent_prompt → environment → skills → 拼接
 """
 
 import os
@@ -26,6 +26,7 @@ class SystemPromptEngine:
     # 模型名称 → 模板文件名 的路由规则
     _MODEL_ROUTES: list[tuple[str, str]] = [
         (r"claude", "anthropic"),
+        (r"deepseek", "deepseek"),
         (r"gpt-4|o1|o3", "beast"),
         (r"gpt.*codex", "codex"),
         (r"gpt", "gpt"),
@@ -34,10 +35,11 @@ class SystemPromptEngine:
     ]
 
     # 指令文件名候选列表（按优先级搜索）
-    _INSTRUCTION_FILES = ["AGENTS.md", "CLAUDE.md", "CONTEXT.md"]
+    _INSTRUCTION_FILES = ["AGENTS.md", "CONTEXT.md"]
 
-    def __init__(self, templates_dir: str):
+    def __init__(self, templates_dir: str, skill_loader=None):
         self._jinja = Environment(loader=FileSystemLoader(templates_dir))
+        self._skill_loader = skill_loader
 
     def _select_template(self, model_id: str) -> str:
         model_lower = model_id.lower()
@@ -65,8 +67,13 @@ class SystemPromptEngine:
         # 4. 环境信息
         env = self._build_environment(ctx.workspace)
 
-        # 5. 拼接
-        parts = [base, instructions, agent_prompt, env]
+        # 5. Skills 列表
+        skills = ""
+        if self._skill_loader:
+            skills = self._skill_loader.to_system_prompt()
+
+        # 6. 拼接
+        parts = [base, instructions, agent_prompt, env, skills]
         return "\n\n".join(p for p in parts if p)
 
     def _load_instructions(self, workspace: str) -> str:

@@ -41,14 +41,25 @@ class TestPermissionRuleset:
         assert rules.can_use("task") is False
         assert rules.can_use("skill") is False
 
+    def test_subagent_permissions(self):
+        rules = PermissionRuleset.subagent()
+        assert rules.can_use("read") is True
+        assert rules.can_use("write") is True
+        assert rules.can_use("bash") is True
+        assert rules.can_use("task") is False
+        assert rules.can_use("question") is False
+
 
 class TestBuiltinAgents:
-    def test_has_seven_agents(self):
-        assert len(BUILTIN_AGENTS) == 7
+    def test_has_ten_agents(self):
+        assert len(BUILTIN_AGENTS) == 10
         assert "build" in BUILTIN_AGENTS
         assert "plan" in BUILTIN_AGENTS
         assert "general" in BUILTIN_AGENTS
         assert "explore" in BUILTIN_AGENTS
+        assert "code" in BUILTIN_AGENTS
+        assert "test" in BUILTIN_AGENTS
+        assert "document" in BUILTIN_AGENTS
         assert "compaction" in BUILTIN_AGENTS
         assert "title" in BUILTIN_AGENTS
         assert "summary" in BUILTIN_AGENTS
@@ -57,6 +68,31 @@ class TestBuiltinAgents:
         build = BUILTIN_AGENTS["build"]
         assert build.mode == "primary"
         assert build.permission.allow_bash is True
+
+    def test_new_worker_agents_are_subagents(self):
+        """验证新增的 worker 类型都是 subagent 模式。"""
+        for agent_type in ["code", "test", "document"]:
+            agent = BUILTIN_AGENTS[agent_type]
+            assert agent.mode == "subagent", f"{agent_type} should be subagent"
+
+    def test_document_agent_permissions(self):
+        """验证 document agent 没有 bash 权限。"""
+        doc = BUILTIN_AGENTS["document"]
+        assert doc.permission.allow_bash is False
+        assert doc.permission.allow_file_write is True
+
+    def test_test_agent_permissions(self):
+        """验证 test agent 有 bash 权限。"""
+        test = BUILTIN_AGENTS["test"]
+        assert test.permission.allow_bash is True
+        assert test.permission.allow_file_write is True
+
+    def test_code_agent_permissions(self):
+        """验证 code agent 有完整权限。"""
+        code = BUILTIN_AGENTS["code"]
+        assert code.permission.allow_bash is True
+        assert code.permission.allow_file_write is True
+        assert "task" in code.permission.deny_tools
 
     def test_hidden_agents_not_in_list(self):
         registry = AgentRegistry(None)

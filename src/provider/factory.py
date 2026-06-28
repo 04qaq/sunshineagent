@@ -23,16 +23,16 @@ class ProviderFactory:
 
         key = ""
         url = ""
+        protocol = "openai-compatible"
         if self._registry:
             p = self._registry.get_provider(provider_id)
             if p:
                 key = p.api_key
                 url = p.base_url
+                protocol = p.protocol
 
-        if provider_id == "anthropic":
+        if protocol == "anthropic":
             client = AnthropicClient(api_key=key or None, base_url=url or None)
-        elif provider_id == "openai":
-            client = OpenAIClient(api_key=key or None, base_url=url or None)
         else:
             client = OpenAIClient(api_key=key or None, base_url=url or None)
 

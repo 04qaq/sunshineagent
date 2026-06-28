@@ -4,6 +4,7 @@
 - _run_turn (single turn): Human's module — LLM 流式调用 + 工具结算
 """
 
+import asyncio
 import json
 from dataclasses import dataclass
 from enum import Enum
@@ -12,7 +13,7 @@ from src.agent.agent import AgentInfo
 from src.agent.builtins import AgentRegistry
 from src.agent.permissions import PermissionRuleset
 from src.prompt.engine import SystemPromptEngine
-from src.provider.base import ProviderClient
+from src.provider.base import ContentBlock, ProviderClient, UnifiedMessage
 from src.provider.factory import ProviderFactory
 from src.session.compaction import CompactionService
 from src.session.coordinator import RunCoordinator
@@ -91,15 +92,20 @@ class AgentLoop:
             if max_steps and step > max_steps:
                 break
 
-            needs_compact = await self.compaction.check(ctx.session_id, messages)
+            needs_compact = await self.compaction.check(
+                ctx.session_id, messages,
+                provider_id=ctx.provider_id, model_id=ctx.model_id,
+            )
             if needs_compact:
                 await self.compaction.execute(ctx.session_id, messages)
                 continue
 
             system = await self.system_prompt.build(agent, ctx)
 
-            tools = await self.tools.resolve_for_agent(agent)
-            model_messages = self._to_model_messages(messages, ctx.provider_id)
+            tools = await self.tools.resolve_for_agent(
+                agent, override_permission=ctx.permission
+            )
+            model_messages = self._to_unified_messages(messages)
 
             provider = self.provider_factory.create(ctx.provider_id)
 
@@ -253,62 +259,54 @@ class AgentLoop:
         ctx: SessionContext,
         agent: AgentInfo,
         tool_calls: list,
-    ) -> list:
-        results = []
+    ) -> list[dict]:
+        # 1. 预验证：按 tool_call_id 索引，校验权限和存在性
+        valid: dict[str, tuple] = {}  # call_id → (tool, args)
+        results: list[dict] = []
+
         for tc in tool_calls:
-            try:
-                args = {}
-                if isinstance(tc.args, str) and tc.args:
-                    args = json.loads(tc.args)
-                elif isinstance(tc.args, dict):
-                    args = tc.args
+            args = {}
+            if isinstance(tc.args, str) and tc.args:
+                args = json.loads(tc.args)
+            elif isinstance(tc.args, dict):
+                args = tc.args
 
-                tool = self.tools.get(tc.name)
-                if not tool:
-                    results.append(
-                        {
-                            "call_id": tc.id,
-                            "output": f"Unknown tool: {tc.name}",
-                            "is_error": True,
-                        }
-                    )
-                    continue
-
-                if agent.permission and not agent.permission.can_use(tc.name):
-                    results.append(
-                        {
-                            "call_id": tc.id,
-                            "output": f"Permission denied: {tc.name}",
-                            "is_error": True,
-                        }
-                    )
-                    continue
-
-                tool_ctx = ToolContext(
-                    session_id=ctx.session_id,
-                    agent=ctx.agent_name,
-                    assistant_message_id=None,
-                    tool_call_id=tc.id,
-                )
-
-                output = await tool.execute(args, tool_ctx)
-                truncated = self._truncate_output(output, max_tokens=10000)
+            tool = self.tools.get(tc.name)
+            if not tool:
                 results.append(
-                    {
-                        "call_id": tc.id,
-                        "output": truncated,
-                        "is_error": False,
-                    }
+                    {"call_id": tc.id, "output": f"Unknown tool: {tc.name}", "is_error": True}
                 )
+                continue
 
-            except Exception as e:
+            if agent.permission and not agent.permission.can_use(tc.name):
                 results.append(
-                    {
-                        "call_id": tc.id,
-                        "output": str(e),
-                        "is_error": True,
-                    }
+                    {"call_id": tc.id, "output": f"Permission denied: {tc.name}", "is_error": True}
                 )
+                continue
+
+            valid[tc.id] = (tool, args, tc.name)
+
+        # 2. 并行执行所有校验通过的工具
+        if valid:
+            async def _run_one(call_id, tool, args):
+                try:
+                    tool_ctx = ToolContext(
+                        session_id=ctx.session_id,
+                        agent=ctx.agent_name,
+                        assistant_message_id=None,
+                        tool_call_id=call_id,
+                    )
+                    output = await tool.execute(args, tool_ctx)
+                    truncated = self._truncate_output(output, max_tokens=10000)
+                    return {"call_id": call_id, "output": truncated, "is_error": False}
+                except Exception as e:
+                    return {"call_id": call_id, "output": str(e), "is_error": True}
+
+            parallel_results = await asyncio.gather(
+                *(_run_one(cid, t, a) for cid, (t, a, _) in valid.items())
+            )
+            results.extend(parallel_results)
+
         return results
 
     def _truncate_output(self, result, max_tokens: int = 10000) -> str:
@@ -318,105 +316,15 @@ class AgentLoop:
         return output
 
     @staticmethod
-    def _to_model_messages(messages: list, provider_id: str) -> list[dict]:
-        """将 DB 消息转为 LLM API 格式。
+    def _to_unified_messages(messages: list) -> list[UnifiedMessage]:
+        """将 DB 消息转为 provider-agnostic UnifiedMessage 列表。
 
-        Anthropic: tool_use / tool_result 在同一消息的 content 数组中
-        OpenAI:   tool_calls 在 assistant 消息，tool_result 为独立 role=tool 消息
+        每个 provider client 负责将自己格式化为对应的 wire format。
+        这避免了在 agent loop 中耦合 provider 特定的格式逻辑。
         """
-        if provider_id == "openai":
-            return AgentLoop._to_openai_messages(messages)
-        return AgentLoop._to_anthropic_messages(messages)
-
-    @staticmethod
-    def _to_anthropic_messages(messages: list) -> list[dict]:
-        result: list[dict] = []
+        result: list[UnifiedMessage] = []
         for msg in messages:
             parts = json.loads(msg.parts or "[]")
-            content: list[dict] = []
-            for p in parts:
-                if p["type"] == "text":
-                    content.append({"type": "text", "text": p["text"]})
-                elif p["type"] == "tool_call":
-                    content.append(
-                        {
-                            "type": "tool_use",
-                            "id": p["tool_call_id"],
-                            "name": p["tool_name"],
-                            "input": p["args"],
-                        }
-                    )
-                elif p["type"] == "tool_result":
-                    content.append(
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": p["tool_call_id"],
-                            "content": p["output"],
-                            "is_error": p.get("is_error", False),
-                        }
-                    )
-            result.append({"role": msg.role, "content": content})
-        return result
-
-    @staticmethod
-    def _to_openai_messages(messages: list) -> list[dict]:
-        """转为 OpenAI Chat Completions 格式。
-
-        OpenAI 要求 tool 消息紧跟对应的 assistant(tool_calls) 之后，
-        所以先输出 assistant 消息，再输出 tool_result。
-        """
-        result: list[dict] = []
-
-        for msg in messages:
-            parts = json.loads(msg.parts or "[]")
-            if not parts:
-                continue
-
-            text_parts = [p for p in parts if p["type"] == "text"]
-            tool_calls = [p for p in parts if p["type"] == "tool_call"]
-            tool_results = [p for p in parts if p["type"] == "tool_result"]
-
-            # 1. 构建主消息（user / assistant）
-            content: str | None = None
-            if text_parts:
-                content = "\n".join(p["text"] for p in text_parts)
-
-            tc_list = None
-            if tool_calls:
-                tc_list = []
-                for tc in tool_calls:
-                    args = tc.get("args", {})
-                    if isinstance(args, dict):
-                        args = json.dumps(args)
-                    tc_list.append(
-                        {
-                            "id": tc["tool_call_id"],
-                            "type": "function",
-                            "function": {
-                                "name": tc["tool_name"],
-                                "arguments": args,
-                            },
-                        }
-                    )
-
-            msg_data: dict = {"role": msg.role}
-            if content is not None:
-                msg_data["content"] = content
-            if tc_list:
-                msg_data["tool_calls"] = tc_list
-            if content is None and not tc_list:
-                msg_data["content"] = ""
-
-            result.append(msg_data)
-
-            # 2. tool_result 作为独立 role=tool 消息，紧跟 assistant 之后
-            for tr in tool_results:
-                result.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tr["tool_call_id"],
-                        "content": tr["output"],
-                    }
-                )
-
+            content = [ContentBlock.from_part(p) for p in parts]
+            result.append(UnifiedMessage(role=msg.role, content=content))
         return result

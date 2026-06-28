@@ -1,11 +1,15 @@
-"""OpenAI LLM client adapter."""
+"""OpenAI LLM client adapter.
+
+Handles conversion from UnifiedMessage to OpenAI Chat Completions format
+and provider-specific post-processing (类似 OpenCode 的 ProviderTransform).
+"""
 
 import json
 from collections.abc import AsyncIterator
 
 from openai import AsyncOpenAI
 
-from src.provider.base import ProviderClient, StreamEvent
+from src.provider.base import ContentBlock, ProviderClient, StreamEvent, UnifiedMessage
 
 
 class OpenAIClient(ProviderClient):
@@ -17,16 +21,91 @@ class OpenAIClient(ProviderClient):
             base_url=base_url or None,
         )
 
+    def _convert_messages(self, messages: list[UnifiedMessage]) -> list[dict]:
+        """Convert UnifiedMessage list to OpenAI Chat Completions format.
+
+        OpenAI requires tool messages to immediately follow the assistant message
+        that contains the corresponding tool_calls.
+        """
+        result: list[dict] = []
+
+        for msg in messages:
+            text_parts = [b for b in msg.content if b.type == "text"]
+            tool_calls = [b for b in msg.content if b.type == "tool_call"]
+            tool_results = [b for b in msg.content if b.type == "tool_result"]
+
+            # 1. Build main message (user / assistant)
+            content: str | None = None
+            if text_parts:
+                content = "\n".join(b.text for b in text_parts)
+
+            tc_list = None
+            if tool_calls:
+                tc_list = []
+                for tc in tool_calls:
+                    args = tc.tool_args or {}
+                    if isinstance(args, dict):
+                        args = json.dumps(args)
+                    tc_list.append(
+                        {
+                            "id": tc.tool_call_id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.tool_name,
+                                "arguments": args,
+                            },
+                        }
+                    )
+
+            msg_data: dict = {"role": msg.role}
+            if content is not None:
+                msg_data["content"] = content
+            if tc_list:
+                msg_data["tool_calls"] = tc_list
+            if content is None and not tc_list:
+                msg_data["content"] = ""
+
+            result.append(msg_data)
+
+            # 2. tool_result as independent role=tool messages, following assistant
+            for tr in tool_results:
+                result.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tr.tool_call_id,
+                        "content": tr.tool_output,
+                    }
+                )
+
+        return self._postprocess(result)
+
+    def _postprocess(self, messages: list[dict]) -> list[dict]:
+        r"""Provider-specific post-processing.
+
+        Mirrors OpenCode's normalizeMessages() — handles quirks of
+        specific providers that use OpenAI-compatible protocol.
+        """
+        for msg in messages:
+            ctx = msg.get("content")
+
+            # DeepSeek: 不接受 null content（某些版本）
+            if ctx is None:
+                msg["content"] = ""
+
+        return messages
+
     async def stream(
         self,
         model: str,
         system: str,
-        messages: list[dict],
+        messages: list[UnifiedMessage],
         tools: list[dict],
         temperature: float = 0.7,
         top_p: float | None = None,
         max_tokens: int | None = None,
     ) -> AsyncIterator[StreamEvent]:
+        api_messages = self._convert_messages(messages)
+
         openai_tools = None
         if tools:
             if "input_schema" in tools[0]:
@@ -48,7 +127,7 @@ class OpenAIClient(ProviderClient):
 
         stream = await self._client.chat.completions.create(
             model=model,
-            messages=[{"role": "system", "content": system}] + messages,
+            messages=[{"role": "system", "content": system}] + api_messages,
             tools=openai_tools,
             temperature=temperature,
             top_p=top_p,
@@ -91,7 +170,6 @@ class OpenAIClient(ProviderClient):
                 final_finish = fr
                 final_usage = chunk.usage.model_dump() if chunk.usage else None
 
-        # 流结束后，输出累积的 tool_calls 和 finish 事件
         for buf in tool_call_buffer.values():
             if buf["id"]:
                 yield StreamEvent(

@@ -1,0 +1,31 @@
+分析子任务失败原因并给出修正建议。
+
+任务信息：
+- 任务描述：{task}
+- 原始提示：{prompt}
+- 执行次数：第 {attempt} 次
+- 错误信息：{error}
+- 错误历史：{error_history}
+
+请分析：
+1. 失败的根本原因
+2. 是否是任务描述不够清晰（is_prompt_issue）
+3. 是否是上下文/文件缺失（is_context_issue）
+4. 是否是模型能力不足（is_capability_issue）
+
+输出 JSON：
+{
+  "root_cause": "根本原因分析",
+  "is_prompt_issue": true/false,
+  "is_context_issue": true/false,
+  "is_capability_issue": true/false,
+  "suggestions": ["建议1", "建议2"],
+  "revised_prompt": "修正后的 prompt（如果是 prompt 问题）",
+  "additional_files": ["需要添加的文件路径（如果是上下文问题）"]
+}
+
+修正原则：
+- 如果是 prompt 问题：让描述更具体，添加约束和示例
+- 如果是上下文问题：在 additional_files 中添加缺失的文件
+- 如果是能力问题：建议切换到更强的模型
+- 保持任务目标不变，只修正执行方式

@@ -144,17 +144,19 @@ class ToolRegistry:
         """列出所有已注册工具。"""
         return list(self._tools.values())
 
-    async def resolve_for_agent(self, agent) -> list[dict]:
+    async def resolve_for_agent(self, agent, override_permission=None) -> list[dict]:
         """为指定 Agent 解析可用工具列表（过滤权限）。
 
         Args:
             agent: AgentInfo 实例，包含 permission 属性
+            override_permission: 可选，覆盖 agent 自带权限（子 agent 场景）
 
         Returns:
             list[dict]: 已转换为 Anthropic tool 格式的可用工具列表
         """
+        permission = override_permission or agent.permission
         tools = []
         for name, tool in self._tools.items():
-            if agent.permission and agent.permission.can_use(name):
+            if permission and permission.can_use(name):
                 tools.append(tool.to_anthropic_tool())
         return tools

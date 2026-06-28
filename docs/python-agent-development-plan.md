@@ -406,6 +406,21 @@ class PermissionRuleset:
             deny_tools={"*"},  # 拒绝所有工具
         )
 
+    @classmethod
+    def subagent(cls) -> "PermissionRuleset":
+        """子 agent 权限 — 禁止创建孙 agent 和提问。
+
+        对应 Claude Code 的 ALL_AGENT_DISALLOWED_TOOLS:
+        - task: 禁止递归创建孙 agent
+        - question: 异步后台 agent 不能弹窗
+        """
+        return cls(
+            allow_bash=True,
+            allow_network=True,
+            allow_file_write=True,
+            deny_tools={"task", "question"},
+        )
+
     def can_use(self, tool_name: str) -> bool:
         if "*" in self.deny_tools or tool_name in self.deny_tools:
             return False
@@ -1070,116 +1085,70 @@ class ReadTool(Tool):
             return ToolResult(output=f"Error reading file: {e}")
 ```
 
-### 6.5 Task Tool (关键)
+### 6.5 Task Tool (MultiAgent 通信核心)
+
+基于 Claude Code 的 MultiAgent 架构实现。通信模型：**所有 agent 共用同一套 AgentLoop，差异全在 SessionContext 隔离**。
 
 ```python
-# opencode/tool/builtins/task.py
+# src/tool/task.py
 class TaskTool(Tool):
     """
-    子代理创建工具 —— 对应 OpenCode task.ts
-    是 Worker Pool 的基础：创建子 session → 执行 → 返回结果
+    子代理创建工具 — Claude Code 的 AgentTool 等价物。
+
+    架构原则（来自 Claude Code 源码）：
+    1. 同一套 AgentLoop — 差异在 createSubagentContext()
+    2. Worker Context 精简 — 不传父历史，只给任务 spec
+    3. 防递归 — 子 agent 工具箱不含 task/question
+    4. 子→父通信 — <task-result> XML 单向注入
     """
 
-    name = "task"
-    description = "Launch a new agent to handle complex, multi-step tasks autonomously."
+    def __init__(self, sessions, agents, loop_factory, background_jobs,
+                 router: ModelRouter, registry: ProviderRegistry):
+        ...
 
-    parameters = {
-        "type": "object",
-        "properties": {
-            "description": {"type": "string"},
-            "prompt": {"type": "string"},
-            "subagent_type": {
-                "type": "string",
-                "enum": ["general", "explore"],
-            },
-            "model": {
-                "type": "string",
-                "description": "Optional model override",
-            },
-            "run_in_background": {"type": "boolean", "default": False},
-        },
-        "required": ["description", "prompt", "subagent_type"],
-    }
+    async def execute(self, params, ctx) -> ToolResult:
+        # 1. ModelRouter 选择模型（能力匹配 + cost ≤ 父模型）
+        # 2. 创建子 session (parent_id=父session_id)
+        # 3. 构建 Worker Context — 精简：只含 task prompt + system_prompt
+        # 4. PermissionRuleset.subagent() — 禁止 task/question
+        # 5. 执行 loop.run()（父子用同一 AgentLoop）
+        # 6. 返回 <task-result> XML
 
-    def __init__(
-        self,
-        sessions: SessionService,
-        agents: AgentRegistry,
-        agent_loop_factory,   # → AgentLoop
-        background_jobs,      # → BackgroundJobManager
-    ):
-        self.sessions = sessions
-        self.agents = agents
-        self.loop_factory = agent_loop_factory
-        self.jobs = background_jobs
+# 通信协议 — 子→父 XML 注入（对应 Claude Code task-notification）
+# <task-result>
+#   <agent>explore</agent>
+#   <status>completed|failed|stopped</status>
+#   <result>具体结果文本</result>
+#   <usage total_tokens="1234" tool_calls="3" />
+#   <duration_ms>4567</duration_ms>
+# </task-result>
 
-    async def execute(self, params: dict, ctx: ToolContext) -> ToolResult:
-        subagent_type = params["subagent_type"]
-        agent = await self.agents.get(subagent_type)
-        if not agent:
-            return ToolResult(output=f"Unknown subagent type: {subagent_type}")
+# 工具锁定 — PermissionRuleset.subagent()
+# 子 agent 不能调用:
+#   - task（防递归创建孙 agent）
+#   - question（后台 agent 不能弹窗）
 
-        # 1. 创建子 session
-        child = await self.sessions.create(
-            parent_id=ctx.session_id,
-            agent=subagent_type,
-            title=params["description"],
-            provider_id=params.get("model", "default"),  # 简化
-        )
-
-        # 2. 构建 Worker Context（精简，不是完整历史）
-        worker_prompt = self._build_worker_context(params, agent)
-
-        # 3. 注入 prompt 为 user message
-        await self.sessions.create_message(
-            child.id, "user",
-            parts=[{"type": "text", "text": worker_prompt}],
-        )
-
-        # 4. 启动执行
-        run_ctx = SessionContext(
-            session_id=child.id,
-            agent_name=subagent_type,
-            provider_id=params.get("model", "default"),
-            model_id=params.get("model", "default"),
-            max_steps=agent.max_steps,
-            permission=agent.permission,
-        )
-
-        if params.get("run_in_background"):
-            # Background: 启动后立即返回
-            job = await self.jobs.start(child.id, self._run_worker(run_ctx))
-            return ToolResult(
-                task_id=child.id,
-                output=f"Task started in background. session_id={child.id}",
-            )
-        else:
-            # Foreground: 等待完成
-            loop = self.loop_factory()
-            await loop.run(run_ctx)
-            # 返回子 session 的最后结果
-            messages = await self.sessions.get_messages(child.id)
-            last = messages[-1] if messages else None
-            if last:
-                parts = json.loads(last.parts)
-                text_parts = [p["text"] for p in parts if p["type"] == "text"]
-                return ToolResult(output="\n".join(text_parts))
-            return ToolResult(output="Task completed with no output.")
-
-    def _build_worker_context(self, params: dict, agent: AgentInfo) -> str:
-        """构建 Worker 专用的精简上下文"""
-        lines = [
-            f"Task: {params['description']}",
-            f"Goal: {params['prompt']}",
-            "",
-            agent.system_prompt or "",
-        ]
-        return "\n".join(lines)
-
-    async def _run_worker(self, ctx: SessionContext):
-        loop = self.loop_factory()
-        return await loop.run(ctx)
+# Worker Context 精简原则（对应 Claude Code createSubagentContext）:
+#   父 agent: messages(100+), readFileState(50文件), depth=0
+#                ↓ 隔离后 ↓
+#   子 agent: messages(1条), readFileState(全新), depth=1
+#             看不到父历史, 不共享缓存, 身份独立
 ```
+
+**与 Claude Code 的对照**：
+
+| 维度 | Claude Code | SunshineAgent |
+|------|------------|---------------|
+| Agent Loop | 共用 query()/queryLoop() | 共用 AgentLoop |
+| 上下文隔离 | createSubagentContext() 20+ 字段逐字段决策 | SessionContext 隔离 |
+| Worker 上下文 | 只给 spec + system_prompt | 同，_build_worker_context() |
+| 防递归 | ALL_AGENT_DISALLOWED_TOOLS | PermissionRuleset.subagent() |
+| 子→父通信 | `<task-notification>` XML 注入 | `<task-result>` XML 注入 |
+| 模型选择 | Agent.model ?? 父 model | ModelRouter 能力路由 |
+| Resume/Continue | transcript 持久化 | ❌ 未实现（后续） |
+| Coordinator 模式 | 370 行专用 prompt | ❌ 未实现（后续） |
+| Fork (Cache) | 字节级 prompt 匹配 | ❌ 未实现（后续） |
+
 
 ---
 

@@ -48,9 +48,23 @@ class PermissionRuleset:
             deny_tools={"*"},
         )
 
+    @classmethod
+    def subagent(cls) -> "PermissionRuleset":
+        """子 agent 权限 — 禁止创建孙 agent 和提问。
+
+        对应 Claude Code 的 ALL_AGENT_DISALLOWED_TOOLS：
+        子 agent 不能调用 task（防递归）、question（后台不能弹窗）。
+        """
+        return cls(
+            allow_bash=True,
+            allow_network=True,
+            allow_file_write=True,
+            deny_tools={"task", "question"},
+        )
+
     def can_use(self, tool_name: str) -> bool:
         if "*" in self.deny_tools or tool_name in self.deny_tools:
             return False
-        if tool_name in self.allow_tools:
-            return True
+        if self.allow_tools:
+            return tool_name in self.allow_tools
         return self.allow_bash or self.allow_file_write

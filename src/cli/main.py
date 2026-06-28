@@ -34,8 +34,10 @@ from src.mcp import (
 )
 from src.models.database import Database
 from src.prompt.engine import SystemPromptEngine
+from src.skill import SkillLoader
 from src.provider.factory import ProviderFactory
 from src.provider.registry import ProviderRegistry
+from src.provider.router import ModelRouter
 from src.session.compaction import CompactionService
 from src.session.coordinator import RunCoordinator
 from src.session.service import SessionService
@@ -109,11 +111,19 @@ async def _init(ctx: AppContext, workspace: Path):
     ctx.tools = ToolRegistry()
     ctx.registry = ProviderRegistry(c.workspace_root)
     ctx.provider_factory = ProviderFactory(ctx.registry)
-    ctx.system_engine = SystemPromptEngine(c.prompts_dir)
+
+    skill_dirs = [
+        str(Path.home() / ".opencode" / "skills"),
+        str(workspace / ".opencode" / "skills"),
+    ]
+    skill_loader = SkillLoader(skill_dirs)
+    await skill_loader.load_all()
+
+    ctx.system_engine = SystemPromptEngine(c.prompts_dir, skill_loader=skill_loader)
     ctx.compaction = CompactionService(ctx.provider_factory, ctx.sessions)
     ctx.mcp = MCPClient()
 
-    _register_tools(ctx, workspace)
+    _register_tools(ctx, workspace, skill_loader)
 
     # 连接项目 MCP servers（自动加载，Agent 可见）
     project_mcp = load_project_configs(c.workspace_root)
@@ -134,7 +144,7 @@ async def _init(ctx: AppContext, workspace: Path):
             ctx._mcp_configs.append(mcfg)
 
 
-def _register_tools(ctx: AppContext, workspace: Path):
+def _register_tools(ctx: AppContext, workspace: Path, skill_loader=None):
     ws = str(workspace)
     t = ctx.tools
     t.register(ReadTool(ws))
@@ -150,7 +160,7 @@ def _register_tools(ctx: AppContext, workspace: Path):
     t.register(ApplyPatchTool(ws))
     t.register(LSPTool())
     t.register(PlanExitTool())
-    t.register(SkillTool(None))
+    t.register(SkillTool(skill_loader))
 
     def _lf():
         return AgentLoop(
@@ -164,7 +174,8 @@ def _register_tools(ctx: AppContext, workspace: Path):
         )
 
     ctx._loop_factory = _lf
-    t.register(TaskTool(ctx.sessions, ctx.agents, _lf, ctx.jobs))
+    router = ModelRouter()
+    t.register(TaskTool(ctx.sessions, ctx.agents, _lf, ctx.jobs, router, ctx.registry))
 
 
 async def _send_prompt(
@@ -228,23 +239,23 @@ async def _send_prompt(
     return result_msg_id
 
 
-def _has_key(c, provider: str) -> bool:
-    if provider == "openai":
-        return bool(c.openai_api_key)
-    if provider == "anthropic":
-        return bool(c.anthropic_api_key)
+def _has_key(c, provider: str, registry=None) -> bool:
+    if registry:
+        p = registry.get_provider(provider)
+        if p:
+            return bool(p.api_key)
     return False
 
 
-def _key_status(c, provider: str) -> str:
-    return "[green]✓[/green]" if _has_key(c, provider) else "[red]✗ 未设置[/red]"
+def _key_status(c, provider: str, registry=None) -> str:
+    return "[green]✓[/green]" if _has_key(c, provider, registry) else "[red]✗ 未设置[/red]"
 
 
-def _get_base_url(c, provider: str) -> str | None:
-    if provider == "openai":
-        return c.openai_base_url
-    if provider == "anthropic":
-        return c.anthropic_base_url
+def _get_base_url(c, provider: str, registry=None) -> str | None:
+    if registry:
+        p = registry.get_provider(provider)
+        if p and p.base_url:
+            return p.base_url
     return None
 
 
@@ -268,13 +279,14 @@ def run(
 
     async def _go():
         ctx = AppContext()
-        if base_url:
-            if provider == "openai":
-                ctx.config.openai_base_url = base_url
-            elif provider == "anthropic":
-                ctx.config.anthropic_base_url = base_url
         await _init(ctx, workspace)
         load_config(ctx.config)
+        if base_url:
+            p = ctx.registry.get_provider(provider)
+            if p:
+                p.base_url = base_url
+            else:
+                ctx.registry.add_provider(provider, provider.title(), base_url=base_url)
         await _send_prompt(
             ctx, prompt, agent_name=agent, model_id=model,
             provider_id=provider, steps=steps, quiet=quiet,
@@ -329,14 +341,15 @@ async def _repl_async(
     app_ctx = AppContext()
     c = app_ctx.config
 
-    if base_url:
-        if provider_id == "openai":
-            c.openai_base_url = base_url
-        elif provider_id == "anthropic":
-            c.anthropic_base_url = base_url
-
     await _init(app_ctx, workspace)
     load_config(c)
+
+    if base_url:
+        p = app_ctx.registry.get_provider(provider_id)
+        if p:
+            p.base_url = base_url
+        else:
+            app_ctx.registry.add_provider(provider_id, provider_id.title(), base_url=base_url)
 
     reg = app_ctx.registry
     _agent = c.default_agent
@@ -381,10 +394,8 @@ async def _repl_async(
                     f"  name=[bold]{m.name}[/bold]"
                     f"  cost={m.cost}  cap={m.capability}"
                 )
-            status_line += f"  key={_key_status(c, _provider)}"
-            bu = _get_base_url(c, _provider)
-            if not bu and reg.get_provider(_provider):
-                bu = reg.get_provider(_provider).base_url
+            status_line += f"  key={_key_status(c, _provider, reg)}"
+            bu = _get_base_url(c, _provider, reg)
             if bu:
                 status_line += f"  base=[dim]{bu}[/dim]"
             console.print(f"  {status_line}")
@@ -458,11 +469,7 @@ async def _handle_command(
         parts2 = args.split(maxsplit=1)
         prov = parts2[0].lower()
         key = parts2[1] if len(parts2) > 1 else ""
-        if prov == "openai":
-            c.openai_api_key = key
-        elif prov == "anthropic":
-            c.anthropic_api_key = key
-        else:
+        if not ctx.registry.get_provider(prov):
             console.print(f"[red]未知 provider: {prov}[/red]")
             return None
         ctx.registry.set_key(prov, key)
@@ -472,13 +479,19 @@ async def _handle_command(
         return None
 
     if action == "/baseurl":
-        c.openai_base_url = args if args else None
-        c.anthropic_base_url = args if args else None
-        if ctx.registry and c.default_provider in ctx.registry.providers:
-            ctx.registry.set_url(c.default_provider, args or "")
+        if not args:
+            console.print("[red]用法: /baseurl <provider> <url>[/red]")
+            return None
+        parts2 = args.split(maxsplit=1)
+        prov = parts2[0].lower()
+        url = parts2[1] if len(parts2) > 1 else ""
+        if not ctx.registry.get_provider(prov):
+            console.print(f"[red]未知 provider: {prov}[/red]")
+            return None
+        ctx.registry.set_url(prov, url)
         ctx.registry.save()
         ctx.provider_factory._clients.clear()
-        console.print(f"[green]✓ base_url = {args or '默认（已清除）'}[/green]")
+        console.print(f"[green]✓ {prov} base_url = {url or '默认'}[/green]")
         return None
 
     if action == "/model":
@@ -760,7 +773,7 @@ def _print_status(ctx):
     reg = ctx.registry
     c = ctx.config
     p = reg.get_provider(reg.default_provider)
-    key_status = _key_status(c, reg.default_provider)
+    key_status = _key_status(c, reg.default_provider, reg)
     base_url = p.base_url if p else ""
     console.print(
         Panel.fit(
