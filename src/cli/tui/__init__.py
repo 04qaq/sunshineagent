@@ -1,5 +1,5 @@
-"""TUI 模块 - 基于 Textual 的终端用户界面。"""
+"""SunshineAgent TUI - 现代化终端界面。"""
 
-from src.cli.tui.app import SunshineApp
+from src.cli.tui.app import SunshineTUI, run_tui
 
-__all__ = ["SunshineApp"]
+__all__ = ["SunshineTUI", "run_tui"]

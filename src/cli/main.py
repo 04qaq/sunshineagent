@@ -24,10 +24,9 @@ from src.agent.loop import AgentLoop, SessionContext
 from src.agent.permissions import PermissionRuleset
 from src.background import BackgroundJobManager
 from src.cli.permission_ui import PermissionUI, QuestionUI
-from src.cli.prompt import PromptHistory, PromptInput, PromptParser
+from src.cli.prompt import PromptHistory, PromptParser, PromptInput, is_command
 from src.cli.queue import PromptQueue
-from src.cli.status_bar import StatusBar
-from src.cli.tui.runner import TuiRunner
+from src.cli.status_bar import StatusBar, UsageStats
 from src.config.config import get_config, load_config, save_config
 from src.mcp import (
     MCPClient,
@@ -351,6 +350,7 @@ def tui(
     ),
 ):
     """启动 TUI 模式（分屏界面）"""
+    from src.cli.tui.app import run_tui
 
     async def _go():
         app_ctx = AppContext()
@@ -375,29 +375,50 @@ def tui(
             _provider = raw_model.split("/")[0]
             raw_model = raw_model.split("/", 1)[1]
 
-        # 创建 TUI 运行器
+        # 创建回调函数
         async def on_prompt(text: str):
             await _send_prompt(
                 app_ctx, text,
                 agent_name=_agent, model_id=_model, provider_id=_provider,
             )
 
-        def on_interrupt():
-            # TODO: 实现中断逻辑
-            pass
+        async def on_new_session():
+            nonlocal _agent, _model, _provider
+            session = await app_ctx.sessions.create(
+                agent=app_ctx.config.default_agent,
+                provider_id=app_ctx.config.default_provider,
+                model_id=app_ctx.config.default_model,
+            )
+            app_ctx._current_session_id = session.id
 
-        runner = TuiRunner(
+        async def on_resume_session(session_id: str):
+            app_ctx._current_session_id = session_id
+
+        async def on_switch_model(model_id: str):
+            nonlocal _model, _provider
+            _model = model_id
+            m = reg.resolve(model_id)
+            if m:
+                _provider = m.provider
+
+        async def on_switch_agent(agent_name: str):
+            nonlocal _agent
+            _agent = agent_name
+
+        await run_tui(
             on_prompt=on_prompt,
-            on_interrupt=on_interrupt,
             agent_name=_agent,
             model_name=raw_model,
+            on_new_session=on_new_session,
+            on_resume_session=on_resume_session,
+            on_switch_model=on_switch_model,
+            on_switch_agent=on_switch_agent,
+            registry=reg,
+            agent_registry=app_ctx.agents,
+            session_service=app_ctx.sessions,
+            db=app_ctx.db,
+            workspace=str(workspace),
         )
-
-        # 更新状态栏
-        runner.update_agent(_agent)
-        runner.update_model(raw_model, _provider)
-
-        await runner.run()
         await app_ctx.db.close()
 
     asyncio.run(_go())
