@@ -7,17 +7,20 @@
 
 from __future__ import annotations
 
-from typing import Any
+import asyncio
+from typing import TYPE_CHECKING, Any
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.message import Message
 from textual.reactive import reactive
 from textual.widgets import Footer, Header
 
 from src.cli.tui.input_box import InputBox
 from src.cli.tui.scrollback import ScrollbackView
 from src.cli.tui.status_bar import TuiStatusBar
+
+if TYPE_CHECKING:
+    from src.cli.tui.runner import TuiRunner
 
 
 class SunshineApp(App):
@@ -118,16 +121,6 @@ class SunshineApp(App):
     current_model: reactive[str] = reactive("")
     is_running: reactive[bool] = reactive(False)
 
-    class PromptSubmitted(Message):
-        """提示提交消息。"""
-        def __init__(self, text: str) -> None:
-            self.text = text
-            super().__init__()
-
-    class InterruptRequested(Message):
-        """中断请求消息。"""
-        pass
-
     def __init__(
         self,
         agent_name: str = "build",
@@ -140,6 +133,11 @@ class SunshineApp(App):
         self._history: list[str] = []
         self._history_index: int | None = None
         self._draft: str = ""
+        self._runner: TuiRunner | None = None
+
+    def set_runner(self, runner: TuiRunner) -> None:
+        """设置 TUI 运行器。"""
+        self._runner = runner
 
     def compose(self) -> ComposeResult:
         """构建 UI 布局。"""
@@ -165,8 +163,9 @@ class SunshineApp(App):
         self._history_index = None
         self._draft = ""
 
-        # 发送提示提交消息
-        self.post_message(self.PromptSubmitted(text))
+        # 通过 runner 处理提示
+        if self._runner:
+            asyncio.create_task(self._runner.handle_prompt(text))
 
         # 清空输入框
         event.input.value = ""
@@ -179,7 +178,8 @@ class SunshineApp(App):
 
     def action_interrupt(self) -> None:
         """中断当前执行。"""
-        self.post_message(self.InterruptRequested())
+        if self._runner:
+            self._runner.handle_interrupt()
 
     def action_new_session(self) -> None:
         """创建新会话。"""

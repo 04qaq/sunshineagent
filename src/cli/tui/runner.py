@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -45,7 +44,6 @@ class TuiRunner:
         self._model_name = model_name
 
         self._app: SunshineApp | None = None
-        self._loop: asyncio.AbstractEventLoop | None = None
 
     async def run(self) -> None:
         """运行 TUI。"""
@@ -54,38 +52,40 @@ class TuiRunner:
             model_name=self._model_name,
         )
 
-        # 注册消息处理器
-        self._app.on(SunshineApp.PromptSubmitted, self._handle_prompt)
-        self._app.on(SunshineApp.InterruptRequested, self._handle_interrupt)
+        # 设置回调函数
+        self._app.set_runner(self)
 
         # 运行应用
         await self._app.run_async()
 
-    async def _handle_prompt(self, event: SunshineApp.PromptSubmitted) -> None:
+    async def handle_prompt(self, text: str) -> None:
         """处理提示提交。"""
-        text = event.text.strip()
+        text = text.strip()
         if not text:
             return
 
         # 显示用户消息
-        self._app.add_message("user", text)
+        if self._app:
+            self._app.add_message("user", text)
 
-        # 设置运行状态
-        self._app.set_running(True)
-        self._app.update_status(running=True)
+            # 设置运行状态
+            self._app.set_running(True)
+            self._app.update_status(running=True)
 
         try:
             # 调用后端处理
             await self._on_prompt(text)
         except Exception as e:
             # 显示错误
-            self._app.add_message("error", str(e))
+            if self._app:
+                self._app.add_message("error", str(e))
         finally:
             # 恢复状态
-            self._app.set_running(False)
-            self._app.update_status(running=False)
+            if self._app:
+                self._app.set_running(False)
+                self._app.update_status(running=False)
 
-    def _handle_interrupt(self, event: SunshineApp.InterruptRequested) -> None:
+    def handle_interrupt(self) -> None:
         """处理中断请求。"""
         if self._on_interrupt:
             self._on_interrupt()
