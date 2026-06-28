@@ -28,6 +28,13 @@ node_modules/
 # 参考源码，不纳入版本控制
 docs/
 
+# 配置文件
+.claude/
+.codegraph/
+
+# 测试文件
+tests/
+
 # 本地配置和数据
 .sunshine/
 .venv/
